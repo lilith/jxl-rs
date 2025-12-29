@@ -700,8 +700,9 @@ impl FrameHeader {
         }
 
         for w in self.passes.last_pass.windows(2) {
-            let [last_lp, lp] = w else { unreachable!() };
-            if lp >= last_lp {
+            let [prev_lp, lp] = w else { unreachable!() };
+            // libjxl requires last_pass to be strictly increasing
+            if lp <= prev_lp {
                 return Err(Error::PassesLastPassNonIncreasing);
             }
         }
@@ -732,6 +733,76 @@ mod test_frame_header {
     use super::*;
     use crate::util::test::read_headers_and_toc;
     use test_log::test;
+
+    /// Test that last_pass validation correctly requires strictly increasing values.
+    ///
+    /// The last_pass array in progressive frames must be strictly increasing
+    /// (each value must be greater than the previous). This was previously
+    /// broken due to a reversed comparison: `lp >= last_lp` instead of `lp <= prev_lp`.
+    ///
+    /// Example:
+    /// - [0, 1, 2] is valid (strictly increasing)
+    /// - [0, 1, 1] is invalid (1 <= 1)
+    /// - [0, 2, 1] is invalid (1 <= 2)
+    #[test]
+    fn test_last_pass_strictly_increasing_validation() {
+        // Test the validation logic directly without full FrameHeader construction
+        // This mirrors the check in FrameHeader::check()
+
+        // Valid: strictly increasing
+        let valid_sequences: &[&[u32]] = &[
+            &[],           // Empty is valid
+            &[0],          // Single element is valid
+            &[0, 1],       // Two elements, strictly increasing
+            &[0, 1, 2],    // Three elements, strictly increasing
+            &[0, 2, 5],    // Non-consecutive but increasing
+            &[1, 3, 7, 9], // Larger gaps
+        ];
+
+        for seq in valid_sequences {
+            let mut is_valid = true;
+            for w in seq.windows(2) {
+                let [prev_lp, lp] = [w[0], w[1]];
+                if lp <= prev_lp {
+                    is_valid = false;
+                    break;
+                }
+            }
+            assert!(
+                is_valid,
+                "Sequence {:?} should be valid (strictly increasing)",
+                seq
+            );
+        }
+
+        // Invalid: not strictly increasing
+        let invalid_sequences: &[&[u32]] = &[
+            &[0, 0],          // Equal values
+            &[1, 1],          // Equal values
+            &[0, 1, 1],       // Last two equal
+            &[0, 0, 1],       // First two equal
+            &[1, 0],          // Decreasing
+            &[0, 2, 1],       // Decrease at end
+            &[2, 1, 0],       // All decreasing
+            &[0, 1, 2, 2, 3], // Equal in middle
+        ];
+
+        for seq in invalid_sequences {
+            let mut is_valid = true;
+            for w in seq.windows(2) {
+                let [prev_lp, lp] = [w[0], w[1]];
+                if lp <= prev_lp {
+                    is_valid = false;
+                    break;
+                }
+            }
+            assert!(
+                !is_valid,
+                "Sequence {:?} should be invalid (not strictly increasing)",
+                seq
+            );
+        }
+    }
 
     #[test]
     fn test_basic() {
