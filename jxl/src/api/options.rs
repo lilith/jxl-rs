@@ -52,12 +52,47 @@ impl Default for JxlDecoderOptions {
             skip_preview: true,
             desired_intensity_target: None,
             progressive_mode: JxlProgressiveMode::Pass,
-            xyb_output_linear: true,
+            xyb_output_linear: false,
             enable_output: true,
             cms: None,
             pixel_limit: None,
             high_precision: false,
             premultiply_output: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that xyb_output_linear defaults to false to apply sRGB transfer function.
+    ///
+    /// When decoding XYB images, the sRGB transfer function should be applied by default
+    /// to produce correct sRGB output values. Setting xyb_output_linear to true would
+    /// skip this conversion, resulting in incorrect (linear) output.
+    ///
+    /// This was a bug where the default was accidentally set to true.
+    #[test]
+    fn test_default_xyb_output_linear_is_false() {
+        let options = JxlDecoderOptions::default();
+        assert!(
+            !options.xyb_output_linear,
+            "xyb_output_linear should default to false to apply sRGB transfer function"
+        );
+    }
+
+    #[test]
+    fn test_default_options() {
+        let options = JxlDecoderOptions::default();
+        // Verify critical defaults
+        assert!(options.adjust_orientation);
+        assert!(options.render_spot_colors);
+        assert!(options.coalescing);
+        assert!(options.skip_preview);
+        assert!(options.enable_output);
+        assert!(!options.xyb_output_linear); // Must be false for correct sRGB output
+        assert!(!options.high_precision);
+        assert!(!options.premultiply_output);
     }
 }
