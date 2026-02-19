@@ -50,6 +50,7 @@ pub(super) fn read_tag_list(
             _ => return Err(Error::InvalidIccStream),
         };
 
+        // Use checked arithmetic to prevent overflow attacks
         let tagstart = if command & 64 == 0 {
             prev_tagstart
                 .checked_add(prev_tagsize)

@@ -729,6 +729,7 @@ impl FrameHeader {
 
         for w in self.passes.last_pass.windows(2) {
             let [last_lp, lp] = w else { unreachable!() };
+            // libjxl requires last_pass to be strictly increasing
             if lp <= last_lp {
                 return Err(Error::PassesLastPassNonIncreasing);
             }
