@@ -512,6 +512,7 @@ declare_test_file!(
     ooo_jxlp_empty_dc_group_boxes,
     "ooo_jxlp_empty_dc_group_boxes.jxl"
 );
+declare_test_file!(ooo_jxlp_multiframe, "ooo_jxlp_multiframe.jxl");
 declare_test_file!(orientation1_identity, "orientation1_identity.jxl");
 declare_test_file!(
     orientation2_flip_horizontal,
