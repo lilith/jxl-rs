@@ -26,6 +26,21 @@ fn decode_ooo_jxlp_invalid_animated_container() {
     );
 }
 
+// An out-of-order jxlp container is allowed to start a frame in a box that
+// was written in-order, even if other boxes were buffered out-of-order in
+// between. Such files are produced by libjxl's `cjxl --output_mode 2`.
+#[test]
+fn decode_ooo_jxlp_multiframe_container() {
+    let data = std::fs::read("resources/test/ooo_jxlp_multiframe.jxl").unwrap();
+    let frames = decode::<f32>(&data, Default::default()).unwrap();
+    let reference = std::fs::read("resources/test/animation_seek_empty.jxl").unwrap();
+    let reference_frames = decode::<f32>(&reference, Default::default()).unwrap();
+    assert_eq!(frames.len(), reference_frames.len());
+    for (fc, (f, rf)) in frames.iter().zip(&reference_frames).enumerate() {
+        compare_frames(Path::new("ooo_jxlp_multiframe.jxl"), fc, f, rf);
+    }
+}
+
 #[test]
 fn test_preview_size_none_for_regular_files() {
     let file = std::fs::read("resources/test/basic.jxl").unwrap();

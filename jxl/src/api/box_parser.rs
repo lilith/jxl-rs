@@ -51,6 +51,8 @@ struct OOOJxlpBox {
     data: Vec<u8>,
     consumed: usize,
     is_last: bool,
+    // File offset of this box's contents.
+    file_position: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -264,9 +266,8 @@ impl BoxParser {
         }
     }
 
-    pub(super) fn total_bytes_consumed(&self, codestream_bytes_consumed: u64) -> u64 {
-        let (start, b) = self.codestream_pos_to_box.last_key_value().unwrap();
-        b.file_position + codestream_bytes_consumed.saturating_sub(*start)
+    pub(super) fn total_bytes_consumed(&self, _codestream_bytes_consumed: u64) -> u64 {
+        self.local_buffer.consumed()
     }
 
     pub(super) fn aux_boxes(&self, box_type: JxlAuxBoxType) -> &[JxlAuxBox] {
@@ -301,28 +302,33 @@ impl BoxParser {
         }
     }
 
-    fn add_checkpoint(&mut self) {
+    /// Adds a checkpoint for the codestream box that is about to become the
+    /// current one (i.e. the box that the codestream data will next be read
+    /// from, in logical jxlp order).
+    ///
+    /// `file_position` is the file offset of the box's contents and
+    /// `codestream_left` is the amount of codestream bytes the box contains.
+    fn add_checkpoint(
+        &mut self,
+        file_position: u64,
+        codestream_left: Option<u64>,
+        is_valid_checkpoint: bool,
+    ) {
         if !self.allow_checkpoint {
             return;
         }
-        // For a codestream box to be a valid checkpoint, it needs to be decoded
-        // in-order (i.e. all other logically-preceding jxlp boxes have been seen already)
-        // and we must not have seen any future jxlp boxes (which would be stored in the
-        // ooo jxlp buffer).
-        let (codestream_left, is_valid_checkpoint) = match self.state {
-            ParseState::Codestream(c) => (c, self.ooo_jxlp_buffer.is_empty()),
-            ParseState::OOOJxlp(_, c) => (c, false),
-            _ => (None, false),
-        };
+        // Checkpoints are added in logical box order, so the position where
+        // this box's contents start in the codestream is the end position of
+        // the previous box.
         let codestream_position = self
             .codestream_pos_to_box
             .last_key_value()
-            .map(|(p, c)| *p + c.codestream_left.unwrap())
+            .map(|(p, c)| p.saturating_add(c.codestream_left.unwrap_or(u64::MAX)))
             .unwrap_or(0);
         self.codestream_pos_to_box.insert(
             codestream_position,
             BoxParserCheckpoint {
-                file_position: self.local_buffer.consumed(),
+                file_position,
                 box_type: self.latest_codestream_box,
                 codestream_left,
                 is_valid_checkpoint,
@@ -365,7 +371,14 @@ impl BoxParser {
             if is_last {
                 self.state = ParseState::Complete;
             } else if let Some(b) = self.ooo_jxlp_buffer.get(&(j + 1)) {
-                self.latest_codestream_box = CodestreamBoxType::Jxlp(j + 1, b.is_last);
+                let file_position = b.file_position;
+                let len = b.data.len() as u64;
+                let is_last = b.is_last;
+                self.latest_codestream_box = CodestreamBoxType::Jxlp(j + 1, is_last);
+                // The spliced box is not a valid checkpoint: its contents
+                // were consumed from the buffer, not from the file at
+                // `file_position` in order.
+                self.add_checkpoint(file_position, Some(len), false);
             }
         }
     }
@@ -385,8 +398,11 @@ impl BoxParser {
                 if let CodestreamBoxType::Jxlp(j, _) = self.latest_codestream_box
                     && let Some(b) = self.ooo_jxlp_buffer.get(&(j + 1))
                 {
-                    self.latest_codestream_box = CodestreamBoxType::Jxlp(j + 1, b.is_last);
-                    self.add_checkpoint();
+                    let file_position = b.file_position;
+                    let len = b.data.len() as u64;
+                    let is_last = b.is_last;
+                    self.latest_codestream_box = CodestreamBoxType::Jxlp(j + 1, is_last);
+                    self.add_checkpoint(file_position, Some(len), false);
                 }
                 ParseState::BoxNeeded(8)
             }
@@ -468,7 +484,7 @@ impl BoxParser {
                         JxlSignature::Codestream => {
                             self.state = ParseState::Codestream(None);
                             self.latest_codestream_box = CodestreamBoxType::Jxlc;
-                            self.add_checkpoint();
+                            self.add_checkpoint(0, None, true);
                             return Ok(());
                         }
                         JxlSignature::Container => {
@@ -725,7 +741,8 @@ impl BoxParser {
                 }
                 self.latest_codestream_box = CodestreamBoxType::Jxlc;
                 self.state = ParseState::Codestream(content_len);
-                self.add_checkpoint();
+                let file_position = self.local_buffer.consumed();
+                self.add_checkpoint(file_position, content_len, self.ooo_jxlp_buffer.is_empty());
             }
             b"jxlp" => {
                 let index = u32::from_be_bytes(self.local_buffer[..4].try_into().unwrap());
@@ -760,18 +777,21 @@ impl BoxParser {
                             data: vec![],
                             consumed: 0,
                             is_last: last,
+                            file_position: self.local_buffer.consumed(),
                         },
                     );
-                    // We create a known-invalid checkpoint here to ensure
-                    // that the checks work properly, and to count codestream
-                    // length correctly.
-                    self.add_checkpoint();
+                    // No checkpoint is created here: the box's position in
+                    // the codestream is not known yet since some logically
+                    // preceding boxes may not have been seen. A checkpoint
+                    // is added when the box becomes the current codestream
+                    // box.
                     return Ok(());
                 }
                 // In-order jxlp
                 self.latest_codestream_box = CodestreamBoxType::Jxlp(idx, last);
                 self.state = ParseState::Codestream(content_len);
-                self.add_checkpoint();
+                let file_position = self.local_buffer.consumed();
+                self.add_checkpoint(file_position, content_len, self.ooo_jxlp_buffer.is_empty());
             }
             b"brob" => {
                 let inner_type = &self.local_buffer[..4];
