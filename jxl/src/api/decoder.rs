@@ -224,11 +224,17 @@ impl JxlDecoder {
     /// Stored frames that the decoder already has are kept; this seeks to the earliest frame
     /// needed to reconstruct any missing ones (or directly to the target frame if none are
     /// missing), skipping intermediate frames that are not stored.
+    ///
+    /// Returns an error if the restart the seek would use cannot be replayed from a file
+    /// position: in a file with out-of-order jxlp boxes, codestream data needed for the
+    /// restart may sit at an earlier file offset that a restarted input would not read
+    /// again. On such an error the decoder state is left unchanged and decoding can
+    /// continue normally.
     pub fn start_new_frame(&mut self, seek_target: VisibleFrameSeekTarget) -> Result<u64> {
         if !self.codestream_parser.image_info.is_complete() {
             return Err(Error::ApiUsageError("cannot seek before BasicInfo"));
         }
-        let checkpoint = self.codestream_parser.start_new_frame(&seek_target);
+        let checkpoint = self.codestream_parser.start_new_frame(&seek_target)?;
         self.box_parser.reset_to_checkpoint(checkpoint);
         Ok(checkpoint.file_position)
     }

@@ -137,7 +137,15 @@ pub(crate) struct BoxParserCheckpoint {
     box_type: CodestreamBoxType,
     pub(crate) file_position: u64,
     codestream_left: Option<u64>,
+    // Whether a frame header is allowed to start in this box: a box that was
+    // buffered out of order appears in the file before some lower-index box,
+    // so a header start in its payload is not allowed.
     is_valid_checkpoint: bool,
+    // Whether a restart at `file_position` can still supply every codestream
+    // byte that may be needed: false when payload buffered from out-of-order
+    // boxes at earlier file offsets is still required, since a restart would
+    // not see it again.
+    pub(crate) can_restart: bool,
     pub(super) consumed_codestream: u64,
     next_aux_box_idx: usize,
 }
@@ -313,6 +321,7 @@ impl BoxParser {
         file_position: u64,
         codestream_left: Option<u64>,
         is_valid_checkpoint: bool,
+        can_restart: bool,
     ) {
         if !self.allow_checkpoint {
             return;
@@ -332,6 +341,7 @@ impl BoxParser {
                 box_type: self.latest_codestream_box,
                 codestream_left,
                 is_valid_checkpoint,
+                can_restart,
                 consumed_codestream: 0,
                 next_aux_box_idx: self.aux.next_box_idx,
             },
@@ -375,10 +385,12 @@ impl BoxParser {
                 let len = b.data.len() as u64;
                 let is_last = b.is_last;
                 self.latest_codestream_box = CodestreamBoxType::Jxlp(j + 1, is_last);
-                // The spliced box is not a valid checkpoint: its contents
-                // were consumed from the buffer, not from the file at
+                // The spliced box is not a valid checkpoint and cannot be a
+                // restart point: a frame header may not start in a box that
+                // appears before a lower-index box (clause 9.10), and its
+                // contents are served from the buffer, not from the file at
                 // `file_position` in order.
-                self.add_checkpoint(file_position, Some(len), false);
+                self.add_checkpoint(file_position, Some(len), false, false);
             }
         }
     }
@@ -402,7 +414,7 @@ impl BoxParser {
                     let len = b.data.len() as u64;
                     let is_last = b.is_last;
                     self.latest_codestream_box = CodestreamBoxType::Jxlp(j + 1, is_last);
-                    self.add_checkpoint(file_position, Some(len), false);
+                    self.add_checkpoint(file_position, Some(len), false, false);
                 }
                 ParseState::BoxNeeded(8)
             }
@@ -468,8 +480,18 @@ impl BoxParser {
 
     fn advance_to_codestream(&mut self, input: &mut dyn JxlBitstreamInput) -> Result<()> {
         loop {
+            // The current codestream box may be a buffered out-of-order box;
+            // its contents are served by callers through injected_jxlp, so
+            // parsing must not consume more input here.
+            if self.injected_jxlp().is_some() {
+                return Ok(());
+            }
             match self.state {
-                ParseState::Codestream(Some(0)) => self.state = ParseState::BoxNeeded(8),
+                // mark_codestream_read handles an empty codestream box the
+                // same way as one whose last byte was just consumed: it may
+                // complete the codestream or make a buffered out-of-order
+                // box the current one.
+                ParseState::Codestream(Some(0)) => self.mark_codestream_read(0),
                 ParseState::Complete | ParseState::Codestream(_) => return Ok(()),
                 ParseState::SignatureNeeded => {
                     let codestream_signature_len = JxlSignature::Codestream.signature_len();
@@ -484,7 +506,7 @@ impl BoxParser {
                         JxlSignature::Codestream => {
                             self.state = ParseState::Codestream(None);
                             self.latest_codestream_box = CodestreamBoxType::Jxlc;
-                            self.add_checkpoint(0, None, true);
+                            self.add_checkpoint(0, None, true, true);
                             return Ok(());
                         }
                         JxlSignature::Container => {
@@ -742,7 +764,8 @@ impl BoxParser {
                 self.latest_codestream_box = CodestreamBoxType::Jxlc;
                 self.state = ParseState::Codestream(content_len);
                 let file_position = self.local_buffer.consumed();
-                self.add_checkpoint(file_position, content_len, self.ooo_jxlp_buffer.is_empty());
+                let in_order = self.ooo_jxlp_buffer.is_empty();
+                self.add_checkpoint(file_position, content_len, in_order, in_order);
             }
             b"jxlp" => {
                 let index = u32::from_be_bytes(self.local_buffer[..4].try_into().unwrap());
@@ -791,7 +814,15 @@ impl BoxParser {
                 self.latest_codestream_box = CodestreamBoxType::Jxlp(idx, last);
                 self.state = ParseState::Codestream(content_len);
                 let file_position = self.local_buffer.consumed();
-                self.add_checkpoint(file_position, content_len, self.ooo_jxlp_buffer.is_empty());
+                // A header start here is always allowed: every lower-index
+                // box has already been seen. A restart is only possible when
+                // nothing buffered earlier in the file is still needed.
+                self.add_checkpoint(
+                    file_position,
+                    content_len,
+                    true,
+                    self.ooo_jxlp_buffer.is_empty(),
+                );
             }
             b"brob" => {
                 let inner_type = &self.local_buffer[..4];
@@ -852,11 +883,10 @@ impl<'a> CodestreamInput<'a> {
     // The methods below have the same semantics as the methods in JxlBitstreamInput.
 
     pub(super) fn available_bytes(&mut self) -> Result<usize> {
+        self.box_parser.advance_to_codestream(self.input)?;
         if let Some(b) = self.box_parser.injected_jxlp() {
             return Ok(b.data.len() - b.consumed);
         }
-
-        self.box_parser.advance_to_codestream(self.input)?;
         let ParseState::Codestream(r) = self.box_parser.state else {
             return Ok(0);
         };
@@ -866,6 +896,7 @@ impl<'a> CodestreamInput<'a> {
     }
 
     pub(super) fn read(&mut self, buf: &mut [IoSliceMut]) -> Result<usize> {
+        self.box_parser.advance_to_codestream(self.input)?;
         if let Some(b) = self.box_parser.injected_jxlp() {
             let mut r = &b.data[b.consumed..];
             let n = r.read_vectored(buf)?;
@@ -873,8 +904,6 @@ impl<'a> CodestreamInput<'a> {
             self.box_parser.check_ooo_jxlp_done();
             return Ok(n);
         }
-
-        self.box_parser.advance_to_codestream(self.input)?;
         let ParseState::Codestream(r) = self.box_parser.state else {
             return Ok(0);
         };
@@ -901,14 +930,13 @@ impl<'a> CodestreamInput<'a> {
     }
 
     pub(super) fn skip(&mut self, amount: usize) -> Result<usize> {
+        self.box_parser.advance_to_codestream(self.input)?;
         if let Some(b) = self.box_parser.injected_jxlp() {
             let n = (b.data.len() - b.consumed).min(amount);
             b.consumed += n;
             self.box_parser.check_ooo_jxlp_done();
             return Ok(n);
         }
-
-        self.box_parser.advance_to_codestream(self.input)?;
         let ParseState::Codestream(r) = self.box_parser.state else {
             return Ok(0);
         };

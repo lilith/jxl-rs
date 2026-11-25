@@ -13,9 +13,9 @@ use crate::error::Error;
 use crate::image::{Image, ImageDataType};
 use crate::tests::decode::{DecodeParams, as_output_buffers, compare_frames, decode, scan_frames};
 
-// OOO jxlp boxes require any frame to start in a box that has all the logically-before
-// boxes physically before it, and all the logically-after boxes physically after it.
-// This test file does *not* satisfy this property.
+// OOO jxlp boxes require any frame to start in a box that has all the
+// logically-before boxes physically before it (clause 9.10). This test file
+// does *not* satisfy this property.
 #[test]
 fn decode_ooo_jxlp_invalid_animated_container() {
     let data = std::fs::read("resources/test/invalid_animated_ooo_jxlp.jxl").unwrap();
@@ -39,6 +39,216 @@ fn decode_ooo_jxlp_multiframe_container() {
     for (fc, (f, rf)) in frames.iter().zip(&reference_frames).enumerate() {
         compare_frames(Path::new("ooo_jxlp_multiframe.jxl"), fc, f, rf);
     }
+}
+
+// A higher-index jxlp box may legally appear in the file before a lower-index
+// box that contains a frame header start: header starts only have to be in
+// boxes that appear after all lower-index boxes (clause 9.10). The buffered
+// box's payload sits at an earlier file offset, though, so a checkpoint taken
+// while it is buffered cannot serve as a file-position restart point.
+#[test]
+fn decode_ooo_jxlp_header_start_after_early_box() {
+    let codestream = std::fs::read("resources/test/animation_seek_empty.jxl").unwrap();
+    // Frame headers start at codestream positions 8, 28, 48, 68, 86 and 105;
+    // the two visible frames start at 68 and 105. Physical order 0, 2, 1
+    // buffers box 2 while box 1 (codestream bytes 80..106, header starts 86
+    // and 105) parses in order; box 2 (106..121) holds no header start.
+    let container =
+        wrap_with_jxlp_ordered(&codestream, &[(0, 80), (80, 106), (106, 121)], &[0, 2, 1]);
+
+    // The file is valid: it decodes to the same frames as the bare codestream.
+    let frames = decode::<f32>(&container, Default::default()).unwrap();
+    let reference_frames = decode::<f32>(&codestream, Default::default()).unwrap();
+    assert_eq!(frames.len(), reference_frames.len());
+    for (fc, (f, rf)) in frames.iter().zip(&reference_frames).enumerate() {
+        compare_frames(
+            Path::new("ooo_jxlp_header_start_after_early_box"),
+            fc,
+            f,
+            rf,
+        );
+    }
+
+    // Both visible frames get frame info, but only the first frame's start
+    // can serve as a file-position restart point.
+    let scanned = scan_frames(&container, usize::MAX);
+    assert_eq!(scanned.len(), 2);
+    assert!(
+        scanned[0]
+            .seek_target
+            .target
+            .box_parser_checkpoint
+            .can_restart
+    );
+    assert!(
+        !scanned[1]
+            .seek_target
+            .target
+            .box_parser_checkpoint
+            .can_restart
+    );
+
+    // An ordinary seek to the first frame still works and produces identical
+    // pixels.
+    let mut decoder = new_decoder_at_basic_info(&container);
+    let mut input = seek(&mut decoder, &container, &scanned[0]);
+    decode_next_and_compare(
+        &mut decoder,
+        &mut input,
+        &reference_frames[0],
+        "ooo_jxlp_header_start_after_early_box seek",
+        0,
+    );
+
+    // Seeking the second frame on a fresh decoder falls back through its
+    // recorded dependencies to the start of codestream frame 0 (file offset
+    // 52, inside in-order box 0), which is replayable: the seek succeeds and
+    // the skipped visible frame is decoded internally.
+    let mut decoder = new_decoder_at_basic_info(&container);
+    let mut input = seek(&mut decoder, &container, &scanned[1]);
+    decode_next_and_compare(
+        &mut decoder,
+        &mut input,
+        &reference_frames[1],
+        "ooo_jxlp_header_start_after_early_box seek frame 1",
+        1,
+    );
+
+    // Once the decoder already holds the reference frames the target needs,
+    // the only restart left is the frame's own start, which cannot be
+    // replayed from a file position: the seek is refused, and the decoder
+    // state is left untouched, so the same decoder goes on to decode the
+    // frame and finish the file.
+    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    let mut input = &container[..];
+    while decoder.process(&mut input, None, None).unwrap() != Event::FrameHeader {}
+    let mut decoded: Vec<Image<f32>> = reference_frames[0]
+        .iter()
+        .map(|img| Image::new(img.size()).unwrap())
+        .collect();
+    let mut buffers = as_output_buffers(&mut decoded);
+    assert!(matches!(
+        decoder.process(&mut input, Some(&mut buffers), None),
+        Ok(Event::FrameComplete { .. })
+    ));
+    compare_frames(
+        Path::new("ooo_jxlp_header_start_after_early_box sequential"),
+        0,
+        &reference_frames[0],
+        &decoded,
+    );
+
+    let res = decoder.start_new_frame(scanned[1].seek_target);
+    assert!(
+        matches!(res, Err(Error::ApiUsageError(_))),
+        "expected refused seek, got {res:?}"
+    );
+    while decoder.process(&mut input, None, None).unwrap() != Event::FrameHeader {}
+    let mut decoded: Vec<Image<f32>> = reference_frames[1]
+        .iter()
+        .map(|img| Image::new(img.size()).unwrap())
+        .collect();
+    let mut buffers = as_output_buffers(&mut decoded);
+    assert!(matches!(
+        decoder.process(&mut input, Some(&mut buffers), None),
+        Ok(Event::FrameComplete { .. })
+    ));
+    compare_frames(
+        Path::new("ooo_jxlp_header_start_after_early_box after refused seek"),
+        1,
+        &reference_frames[1],
+        &decoded,
+    );
+    while decoder.process(&mut input, None, None).unwrap() != Event::Complete {}
+}
+
+// The image header of a file whose lowest-index box is non-empty always
+// starts in that box, which parses in order, so its start is always legal
+// (clause 9.10). Every header start can still be unreplayable: in physical
+// order 1, 0 box 1 is buffered while box 0 parses, so no frame start can
+// serve as a file-position restart point and every seek is refused — while
+// the file itself decodes normally.
+#[test]
+fn decode_ooo_jxlp_unseekable_starts() {
+    let codestream = std::fs::read("resources/test/animation_seek_empty.jxl").unwrap();
+    let container = wrap_with_jxlp_ordered(&codestream, &[(0, 106), (106, 121)], &[1, 0]);
+
+    let frames = decode::<f32>(&container, Default::default()).unwrap();
+    let reference = std::fs::read("resources/test/animation_seek_empty.jxl").unwrap();
+    let reference_frames = decode::<f32>(&reference, Default::default()).unwrap();
+    assert_eq!(frames.len(), reference_frames.len());
+    for (fc, (f, rf)) in frames.iter().zip(&reference_frames).enumerate() {
+        compare_frames(Path::new("ooo_jxlp_unseekable_starts"), fc, f, rf);
+    }
+
+    let scanned = scan_frames(&container, usize::MAX);
+    assert_eq!(scanned.len(), 2);
+    assert!(
+        scanned
+            .iter()
+            .all(|f| !f.seek_target.target.box_parser_checkpoint.can_restart)
+    );
+
+    for f in &scanned {
+        let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+        let mut input = &container[..];
+        while decoder.process(&mut input, None, None).unwrap() != Event::BasicInfo {}
+        let res = decoder.start_new_frame(f.seek_target);
+        assert!(
+            matches!(res, Err(Error::ApiUsageError(_))),
+            "expected refused seek, got {res:?}"
+        );
+        // The refused seek left the decoder state untouched.
+        while decoder.process(&mut input, None, None).unwrap() != Event::Complete {}
+    }
+}
+
+// An empty box may parse in order while a later box is buffered; the empty
+// box's completion must splice in the buffered one. In physical order 2, 0,
+// 1 empty box 1 completes while box 2 is buffered, and no header start sits
+// in the spliced box, so the file is legal.
+#[test]
+fn decode_ooo_jxlp_empty_box_with_early_successor() {
+    let codestream = std::fs::read("resources/test/animation_seek_empty.jxl").unwrap();
+    let container =
+        wrap_with_jxlp_ordered(&codestream, &[(0, 106), (106, 106), (106, 121)], &[2, 0, 1]);
+
+    let frames = decode::<f32>(&container, Default::default()).unwrap();
+    let reference_frames = decode::<f32>(&codestream, Default::default()).unwrap();
+    assert_eq!(frames.len(), reference_frames.len());
+    for (fc, (f, rf)) in frames.iter().zip(&reference_frames).enumerate() {
+        compare_frames(
+            Path::new("ooo_jxlp_empty_box_with_early_successor"),
+            fc,
+            f,
+            rf,
+        );
+    }
+
+    // Every frame start sits in box 0, parsed while box 2 was buffered, so
+    // no start can be a file-position restart point.
+    let scanned = scan_frames(&container, usize::MAX);
+    assert_eq!(scanned.len(), 2);
+    assert!(
+        scanned
+            .iter()
+            .all(|f| !f.seek_target.target.box_parser_checkpoint.can_restart)
+    );
+}
+
+// With an empty lowest-index box, the image header starts in a later box.
+// In physical order 1, 0 that box is buffered while empty box 0 parses, so
+// the header start sits in a box that appears before a lower-index box:
+// disallowed by clause 9.10, and rejected.
+#[test]
+fn decode_ooo_jxlp_image_header_after_early_box() {
+    let codestream = std::fs::read("resources/test/animation_seek_empty.jxl").unwrap();
+    let container = wrap_with_jxlp_ordered(&codestream, &[(0, 0), (0, 121)], &[1, 0]);
+    let res = decode::<f32>(&container, Default::default());
+    assert!(
+        matches!(res, Err(Error::InvalidBox)),
+        "expected error due to image header start in non-valid checkpoint box, got {res:?}"
+    );
 }
 
 #[test]
@@ -718,10 +928,17 @@ fn make_box(ty: &[u8; 4], content: &[u8]) -> Vec<u8> {
 }
 
 fn add_container_header(container: &mut Vec<u8>) {
+    add_container_header_version(container, 0);
+}
+
+fn add_container_header_version(container: &mut Vec<u8>, minor_version: u32) {
     let sig = [
         0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a,
     ];
-    let ftyp = make_box(b"ftyp", b"jxl \x00\x00\x00\x00jxl ");
+    let mut ftyp_content = b"jxl ".to_vec();
+    ftyp_content.extend(minor_version.to_be_bytes());
+    ftyp_content.extend(b"jxl ");
+    let ftyp = make_box(b"ftyp", &ftyp_content);
     container.extend(&sig);
     container.extend(&ftyp);
 }
@@ -752,6 +969,35 @@ fn wrap_with_jxlp_chunks(codestream: &[u8], chunk_starts: &[usize]) -> Vec<u8> {
         if i + 1 == num_chunks {
             index |= 0x8000_0000;
         }
+        payload.extend(index.to_be_bytes());
+        payload.extend(&codestream[begin..end]);
+        container.extend(make_box(b"jxlp", &payload));
+    }
+
+    container
+}
+
+/// Wraps `codestream` in jxlp boxes whose physical file order is given
+/// explicitly: `chunks[i]` is the codestream range of box index `i`, and
+/// `physical_order` lists the box indices in the order they appear in the
+/// file. The highest-index box is marked as the last box.
+fn wrap_with_jxlp_ordered(
+    codestream: &[u8],
+    chunks: &[(usize, usize)],
+    physical_order: &[usize],
+) -> Vec<u8> {
+    let mut container = Vec::new();
+    add_container_header_version(&mut container, 1);
+
+    for &i in physical_order {
+        let (begin, end) = chunks[i];
+        assert!(begin <= end && end <= codestream.len());
+
+        let mut index = i as u32;
+        if i + 1 == chunks.len() {
+            index |= 0x8000_0000;
+        }
+        let mut payload = Vec::with_capacity(4 + (end - begin));
         payload.extend(index.to_be_bytes());
         payload.extend(&codestream[begin..end]);
         container.extend(make_box(b"jxlp", &payload));

@@ -176,7 +176,7 @@ impl CodestreamParser {
     pub(super) fn start_new_frame(
         &mut self,
         seek_target: &VisibleFrameSeekTarget,
-    ) -> BoxParserCheckpoint {
+    ) -> Result<BoxParserCheckpoint> {
         // On the way to a seek target, frames that do not matter for it can be decoded wrong,
         // so stored frames are only usable when not in the middle of a frame or a seek.
         let mid_frame = matches!(self.state, ParserState::Sections { .. });
@@ -196,7 +196,15 @@ impl CodestreamParser {
         {
             start = earlier;
         }
-        let keep_slots = std::array::from_fn(|s| kept(s, start.frame_index));
+        // A restart can only read codestream bytes that appear in the file at
+        // or after the restart offset; in an out-of-order jxlp file some
+        // needed payload may sit at an earlier offset instead.
+        if !start.box_parser_checkpoint.can_restart {
+            return Err(Error::ApiUsageError(
+                "cannot seek: required codestream data is not reachable from a file position",
+            ));
+        }
+        let keep_slots = std::array::from_fn(|s: usize| kept(s, start.frame_index));
         self.slot_frames = std::array::from_fn(|s| have[s].filter(|_| keep_slots[s]));
         self.frame_info.reset(start.frame_counters, keep_slots);
         self.local_buffer.reset();
@@ -207,7 +215,7 @@ impl CodestreamParser {
         self.next_frame_index = start.frame_index;
         self.state = ParserState::FrameHeader { is_preview: false };
         self.header_needed_bytes = None;
-        start.box_parser_checkpoint
+        Ok(start.box_parser_checkpoint)
     }
 
     fn has_more_frames(&self) -> bool {
@@ -295,6 +303,10 @@ impl CodestreamParser {
             match self.state {
                 ParserState::FileHeader => {
                     self.refill_and_parse(input, |c, input| {
+                        // The image header starts at codestream position 0;
+                        // it may only start in a jxlp box that appears after
+                        // all lower-index boxes (clause 9.10).
+                        input.box_parser().state_checkpoint(0)?;
                         c.local_buffer.with_br(|br, bits| {
                             let level5_limits = level5_limits(input, decode_options);
                             c.image_info
