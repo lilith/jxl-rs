@@ -15,6 +15,10 @@ use crate::image::DataTypeTag;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("Unsupported output downsampling shift {0}; expected a value from 0 to 3")]
+    InvalidOutputDownsamplingShift(u8),
+    #[error("Invalid crop region")]
+    InvalidCropRegion,
     #[error("Invalid raw quantization table")]
     InvalidRawQuantTable,
     #[error("Invalid distance band {0}: {1}")]
@@ -63,8 +67,6 @@ pub enum Error {
     InvalidBox,
     #[error("Unexpected end of codestream box")]
     UnexpectedCodestreamBoxEnd,
-    #[error("ICC is too large")]
-    IccTooLarge,
     #[error("Invalid ICC stream: unexpected end of stream")]
     IccEndOfStream,
     #[error("Invalid ICC stream")]
@@ -137,6 +139,8 @@ pub enum Error {
     PipelineChannelTypeMismatch(String, usize, DataTypeTag, DataTypeTag),
     #[error("Invalid stage {0} after extend stage")]
     PipelineInvalidStageAfterExtend(String),
+    #[error("Downsampling level is too high")]
+    DownsampleTooHigh,
     #[error("Trying to copy rects of different size, src: {0}x{1} dst {2}x{3}")]
     CopyOfDifferentSize(usize, usize, usize, usize),
     #[error("LF quantization factor is too small: {0}")]

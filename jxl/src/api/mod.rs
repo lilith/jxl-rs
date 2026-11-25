@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) use box_parser::BoxParserCheckpoint;
 pub use box_parser::{JxlAuxBox, JxlAuxBoxType};
+#[doc(hidden)]
+pub use box_parser::{extract_codestream, pack_codestream};
 pub use color::*;
 pub use data_types::*;
 pub use decoder::*;
@@ -27,8 +29,11 @@ pub use options::*;
 pub use signature::*;
 
 use crate::error::Result;
+use crate::headers::FileHeader;
 pub use crate::headers::image_metadata::Orientation;
-pub use crate::image::JxlOutputBuffer;
+use crate::image::Rect;
+pub use crate::image::{JxlOutputBuffer, JxlOutputTransform};
+use crate::util::ShiftRightCeil;
 
 /// Events emitted by [`JxlDecoder::process`] as decoding progresses.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -56,6 +61,7 @@ pub struct ToneMapping {
 
 #[derive(Clone)]
 pub struct JxlBasicInfo {
+    /// Output dimensions, after the requested downsampling, orientation and crop.
     pub size: (usize, usize),
     pub bit_depth: JxlBitDepth,
     pub orientation: Orientation,
@@ -64,6 +70,26 @@ pub struct JxlBasicInfo {
     pub uses_original_profile: bool,
     pub tone_mapping: ToneMapping,
     pub preview_size: Option<(usize, usize)>,
+}
+
+impl JxlBasicInfo {
+    /// Assumes that origin of `crop_region` is aligned to codestream orientation.
+    fn update_size(
+        &mut self,
+        file_header: &FileHeader,
+        adjust_orientation: bool,
+        downsample_factor: u8,
+        crop_region: Rect,
+    ) {
+        let mut size = crop_region.size;
+        if adjust_orientation {
+            size = file_header.image_metadata.orientation.map_size(size);
+        }
+        self.size = (
+            size.0.shrc(downsample_factor),
+            size.1.shrc(downsample_factor),
+        );
+    }
 }
 
 pub type JxlParallelRunnerFun<'a> = dyn Fn(usize) -> Result<()> + Sync + 'a;

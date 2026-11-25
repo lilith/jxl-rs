@@ -30,7 +30,6 @@ impl Frame {
         upsampled_rect: Rect,
         orientation: Orientation,
         output_buffers: &mut [Option<OutputChannelRef>],
-        full_size: (usize, usize),
         output_color_info: &OutputColorInfo,
         output_tf: &TransferFunction,
     ) -> Result<()> {
@@ -41,7 +40,9 @@ impl Frame {
             color_type,
             data_format,
             color_type.has_alpha(),
+            None,
         );
+        let canvas = self.decoder_state.output_viewport;
         let len = rect.size.0;
         let ulen = len * 8;
         let mut scratch = [
@@ -163,7 +164,7 @@ impl Frame {
                     upsampled_rect.size,
                     uy,
                     upsampled_rect.origin,
-                    full_size,
+                    canvas,
                     (0, 0),
                 )?;
             }
@@ -179,7 +180,7 @@ impl Frame {
         output_profile: &JxlColorProfile,
         parallel_runner: &mut dyn JxlParallelRunner,
     ) -> Result<bool> {
-        if self.header.needs_blending() {
+        if self.decoder_state.output_downsampling_shift != 0 || self.header.needs_blending() {
             return Ok(false);
         }
         if !((self.header.has_lf_frame() && self.header.frame_type == FrameType::RegularFrame)
@@ -219,9 +220,7 @@ impl Frame {
             // We only render color data, and only to 3- or 4- channel output buffers.
             return Ok(false);
         }
-        let sz = &self.decoder_state.file_header.size;
-        let xsize = sz.xsize() as usize;
-        let ysize = sz.ysize() as usize;
+        let (xsize, ysize) = self.decoder_state.file_header.codestream_image_size();
 
         let groups = std::mem::take(&mut self.lf_preview_dirty_groups);
         if groups.is_empty() {
@@ -234,12 +233,17 @@ impl Frame {
             .collect();
         let regions = &regions_storage[..];
 
-        let orientation = image_metadata.orientation;
+        let orientation = if self.decoder_state.adjust_orientation {
+            image_metadata.orientation
+        } else {
+            Orientation::Identity
+        };
         let info = SaveStageBufferInfo {
             downsample: (0, 0),
             orientation,
-            byte_size: data_format.bytes_per_sample() * color_type.samples_per_pixel(),
+            byte_size: data_format.bytes_per_pixel(color_type),
             after_extend: false,
+            output_viewport: Some(self.decoder_state.output_viewport),
         };
         let info = [Some(info)];
         let mut bufs = [Some(JxlOutputBuffer::reborrow(&mut output_buffers[0]))];
@@ -266,7 +270,6 @@ impl Frame {
                 upsampled_rect,
                 orientation,
                 &mut bufs,
-                (xsize, ysize),
                 &output_color_info,
                 &output_tf,
             )

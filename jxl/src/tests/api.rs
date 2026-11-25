@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use crate::api::{
-    AlphaMode, Event, JxlAuxBoxType, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions,
-    JxlPixelFormat, JxlTransferFunction, VisibleFrameInfo,
+    AlphaMode, Event, JxlAuxBoxType, JxlBytesNeeded, JxlColorType, JxlDataFormat, JxlDecoder,
+    JxlDecoderOptions, JxlPixelFormat, JxlProgressiveStatus, JxlTransferFunction, VisibleFrameInfo,
 };
 use crate::error::Error;
 use crate::image::{Image, ImageDataType};
@@ -160,6 +160,23 @@ fn decode_ooo_jxlp_header_start_after_early_box() {
         &decoded,
     );
     while decoder.process(&mut input, None, None).unwrap() != Event::Complete {}
+
+    // `file_length` reports how much of the file the codestream accounts
+    // for: all 189 physical bytes here since the buffered box's payload sits
+    // at a later file offset than the codestream's logical end. For a raw
+    // codestream it is the logical end only, without tail bytes that refill
+    // may have overread.
+    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    let mut input = &container[..];
+    while decoder.process(&mut input, None, None).unwrap() != Event::Complete {}
+    assert_eq!(decoder.file_length(), Some(container.len() as u64));
+
+    let mut raw = codestream.clone();
+    raw.extend_from_slice(&[0xaa; 37]);
+    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    let mut input = &raw[..];
+    while decoder.process(&mut input, None, None).unwrap() != Event::Complete {}
+    assert_eq!(decoder.file_length(), Some(codestream.len() as u64));
 }
 
 // The image header of a file whose lowest-index box is non-empty always
@@ -297,6 +314,37 @@ fn test_set_pixel_format() {
     };
     decoder.set_pixel_format(new_format.clone()).unwrap();
     assert_eq!(decoder.current_pixel_format().unwrap(), &new_format);
+
+    let endianness = crate::api::Endianness::native();
+    for invalid in [
+        JxlDataFormat::U8 { bit_depth: 0 },
+        JxlDataFormat::U8 { bit_depth: 9 },
+        JxlDataFormat::U16 {
+            endianness,
+            bit_depth: 0,
+        },
+        JxlDataFormat::U16 {
+            endianness,
+            bit_depth: 17,
+        },
+    ] {
+        assert!(matches!(
+            decoder.set_pixel_format(JxlPixelFormat {
+                color_type: JxlColorType::Rgb,
+                color_data_format: Some(invalid),
+                extra_channel_format: vec![],
+            }),
+            Err(Error::ApiUsageError(_))
+        ));
+        assert!(matches!(
+            decoder.set_pixel_format(JxlPixelFormat {
+                color_type: JxlColorType::Rgb,
+                color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
+                extra_channel_format: vec![Some(invalid)],
+            }),
+            Err(Error::ApiUsageError(_))
+        ));
+    }
 }
 
 #[test]
@@ -900,12 +948,13 @@ fn flush_truncated_squeeze_missing_avg() {
 }
 
 /// Regression test: flushing a truncated image with tiled channels whose tile
-/// dimension is <= 1 used to panic during smooth-squeeze upsampling.
+/// dimension is 0 used to panic during smooth-squeeze upsampling; non-empty
+/// channels with zero-sized grid tiles are now rejected.
 #[test]
 fn flush_truncated_squeeze_small_tiles() {
     let data = include_bytes!("../../tests/testdata/truncated_squeeze_flush_small_tiles.jxl");
     for chunk_size in [64, 256, usize::MAX] {
-        decode::<f32>(
+        let res = decode::<f32>(
             data,
             DecodeParams {
                 chunk_size,
@@ -913,8 +962,8 @@ fn flush_truncated_squeeze_small_tiles() {
                 allow_partial: true,
                 ..Default::default()
             },
-        )
-        .unwrap();
+        );
+        assert!(matches!(res, Err(Error::TooManySqueezes)), "{res:?}");
     }
 }
 
@@ -1437,7 +1486,7 @@ fn test_fuzzer_xyb_icc_no_panic() {
     if let Ok(Event::BasicInfo) = decoder.process(&mut input, None, None)
         && let Some(profile) = decoder.output_color_profile()
     {
-        let _ = profile.try_as_icc();
+        let _ = profile.try_as_icc(255.0);
     }
 }
 
@@ -1486,6 +1535,45 @@ fn test_squeeze_boundary_minimal() {
                 x / 3,
                 y,
             );
+        }
+    }
+}
+
+/// Regression test for border buffer indexing when unsqueezing from LF to HF.
+#[test]
+fn squeeze_partial_last_group_is_lossless() {
+    const WIDTH: usize = 2049;
+    const HEIGHT: usize = 257;
+    const PATCH_SIZE: usize = 5;
+    const PATCH: [u8; 75] = [
+        68, 32, 130, 60, 253, 230, 241, 194, 107, 48, 249, 14, 199, 221, 1, 228, 136, 117, 52, 162,
+        15, 11, 13, 4, 195, 110, 216, 14, 113, 224, 253, 119, 176, 118, 112, 235, 148, 11, 213, 51,
+        95, 151, 61, 170, 216, 97, 155, 145, 255, 201, 17, 245, 124, 206, 212, 88, 187, 191, 44,
+        224, 55, 83, 201, 189, 250, 15, 240, 22, 157, 201, 87, 86, 116, 6, 102,
+    ];
+    let data = std::fs::read("resources/test/squeeze_2049x257_corner_patch.jxl").unwrap();
+    let frames = decode::<f32>(&data, DecodeParams::default()).unwrap();
+    assert_eq!(frames.len(), 1);
+    let img = &frames[0][0];
+    assert_eq!(img.size(), (WIDTH * 3, HEIGHT));
+
+    for py in 0..PATCH_SIZE {
+        let y = HEIGHT - PATCH_SIZE + py;
+        let row = img.row(y);
+        for px in 0..PATCH_SIZE {
+            let x = WIDTH - PATCH_SIZE + px;
+            for c in 0..3 {
+                let sample = row[x * 3 + c];
+                assert!(
+                    sample.is_finite(),
+                    "non-finite sample at ({x}, {y}), channel {c}"
+                );
+                assert_eq!(
+                    (sample * 255.0).round() as u8,
+                    PATCH[(py * PATCH_SIZE + px) * 3 + c],
+                    "pixel ({x}, {y}), channel {c}"
+                );
+            }
         }
     }
 }
@@ -1659,6 +1747,19 @@ fn test_modular_rle_fast_path() {
         0,
         &frames[0],
         &no_lz77_frames[0],
+    );
+}
+
+/// Regression test: a VarDCT block that codes u32::MAX nonzero coefficients. On 32-bit targets
+/// a non-checked `nonzeros + num_blocks` either panics in debug mode or causes a crash later on.
+#[test]
+fn test_fuzzer_vardct_num_nonzeros_overflow() {
+    let data = include_bytes!("../../tests/testdata/vardct_num_nonzeros_overflow.jxl");
+    let result = decode::<f32>(data, DecodeParams::default());
+    assert!(
+        matches!(result, Err(Error::InvalidNumNonZeros(..))),
+        "expected an invalid number of nonzeros error, got {:?}",
+        result.map(|_| "a decoded image")
     );
 }
 
@@ -2062,4 +2163,248 @@ fn test_decoder_reset() {
         }
         Ok(())
     });
+}
+
+#[test]
+fn unbounded_box_order() {
+    let before = include_bytes!("../../tests/testdata/unbounded_box_before_codestream.jxl");
+    assert!(matches!(
+        decode::<f32>(before, Default::default()),
+        Err(Error::InvalidBox)
+    ));
+
+    let after = include_bytes!("../../tests/testdata/exif_trailing_infinite.jxl");
+    decode::<f32>(after, Default::default()).unwrap();
+}
+
+#[test]
+fn empty_jxlp() {
+    let expected = decode::<f32>(
+        include_bytes!("../../resources/test/basic.jxl"),
+        Default::default(),
+    )
+    .unwrap();
+
+    for (name, data) in [
+        (
+            "empty_jxlp",
+            &include_bytes!("../../tests/testdata/empty_jxlp.jxl")[..],
+        ),
+        (
+            "empty_ooo_jxlp",
+            &include_bytes!("../../tests/testdata/empty_ooo_jxlp.jxl")[..],
+        ),
+    ] {
+        let got = decode::<f32>(data, Default::default()).unwrap();
+        compare_frames(Path::new(name), 0, &expected[0], &got[0]);
+    }
+}
+
+#[test]
+fn test_sample_limit_consecutive_nonvisible_frames() {
+    // `blendmodes_5.jxl` is 1024x1024 with 1 extra channel (4_194_304 samples per full frame):
+    // 4 non-visible 1024x1024 frames followed by 1 visible 1024x1024 frame.
+    let blendmodes =
+        std::fs::read("resources/test/conformance_test_images/blendmodes_5.jxl").unwrap();
+    let nonvisible_total = 4 * 1024 * 1024 * 4;
+    assert_eq!(
+        decode::<f32>(
+            &blendmodes,
+            DecodeParams {
+                sample_limit: Some(nonvisible_total + 1),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    assert!(matches!(
+        decode::<f32>(
+            &blendmodes,
+            DecodeParams {
+                sample_limit: Some(nonvisible_total),
+                ..Default::default()
+            },
+        ),
+        Err(Error::ImageSizeTooLarge(pixels, 1)) if pixels == 4 * 1024 * 1024
+    ));
+
+    // Visible animation frames reset the consecutive non-visible sample counter.
+    let anim =
+        std::fs::read("resources/test/conformance_test_images/animation_icos4d_5.jxl").unwrap();
+    let frames = decode::<f32>(&anim, Default::default()).unwrap();
+    assert!(frames.len() > 1);
+    let (w3, h) = frames[0][0].size();
+    let anim_frame_samples = (w3 / 3).max(16) * h * (2 + frames[0].len());
+    assert_eq!(
+        decode::<f32>(
+            &anim,
+            DecodeParams {
+                sample_limit: Some(anim_frame_samples + 1),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .len(),
+        frames.len()
+    );
+    assert!(matches!(
+        decode::<f32>(
+            &anim,
+            DecodeParams {
+                sample_limit: Some(anim_frame_samples),
+                ..Default::default()
+            },
+        ),
+        Err(Error::ImageSizeTooLarge(..))
+    ));
+}
+
+const ALL_PROGRESSIVE_STATUSES: [JxlProgressiveStatus; 7] = [
+    JxlProgressiveStatus::Pass8x,
+    JxlProgressiveStatus::Pass4xSalient,
+    JxlProgressiveStatus::Pass4x,
+    JxlProgressiveStatus::Pass2xSalient,
+    JxlProgressiveStatus::Pass2x,
+    JxlProgressiveStatus::Pass1xSalient,
+    JxlProgressiveStatus::Pass1x,
+];
+
+fn check_progressive_stepping(data: &[u8], expect_exact: bool) -> Vec<JxlProgressiveStatus> {
+    let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
+    let mut pos = 0;
+    let mut size = (0, 0);
+    let mut bufs: Option<Vec<Image<f32>>> = None;
+    let mut need_input = true;
+    let mut prev_status = None;
+    let mut seen_statuses = Vec::new();
+
+    let mut step = |decoder: &mut JxlDecoder, len: Option<usize>| -> (Event, bool) {
+        let len = len.unwrap_or(usize::from(need_input));
+        let mut slice = &data[pos..pos + len];
+        let mut out_bufs = bufs.as_mut().map(|b| as_output_buffers(b));
+        let ev = decoder
+            .process(&mut slice, out_bufs.as_deref_mut(), None)
+            .unwrap();
+        pos += len - slice.len();
+        match ev {
+            Event::BasicInfo => size = decoder.basic_info().unwrap().size,
+            Event::FrameHeader => {
+                bufs = Some(vec![Image::<f32>::new((size.0 * 3, size.1)).unwrap()]);
+            }
+            _ => {}
+        }
+        need_input = matches!(ev, Event::NeedMoreInput { .. });
+        let cur = decoder.frame_progressive_status();
+        assert!(cur >= prev_status);
+        if let Some(s) = cur
+            && seen_statuses.last() != Some(&s)
+        {
+            seen_statuses.push(s);
+            if s < JxlProgressiveStatus::Pass1x
+                && let Some(b) = bufs.as_mut()
+            {
+                assert!(
+                    decoder
+                        .flush_pixels(&mut as_output_buffers(b), None)
+                        .unwrap()
+                );
+            }
+        }
+        prev_status = cur;
+        (ev, bufs.is_some())
+    };
+
+    let mut in_visible_frame = false;
+    for target in ALL_PROGRESSIVE_STATUSES {
+        while decoder.frame_progressive_status() < Some(target) {
+            let ev;
+            match decoder.bytes_needed_for_status(target) {
+                JxlBytesNeeded::Exact(0) => {
+                    (_, in_visible_frame) = step(&mut decoder, Some(0));
+                    assert!(decoder.frame_progressive_status() >= Some(target));
+                }
+                JxlBytesNeeded::Exact(n) => {
+                    if n > 1 {
+                        (ev, in_visible_frame) = step(&mut decoder, Some(n - 1));
+                        assert!(matches!(ev, Event::NeedMoreInput { .. }));
+                        assert!(decoder.frame_progressive_status() < Some(target));
+                        assert_eq!(
+                            decoder.bytes_needed_for_status(target),
+                            JxlBytesNeeded::Exact(1)
+                        );
+                    }
+                    if !in_visible_frame {
+                        assert_eq!(
+                            decoder.bytes_needed_for_status(JxlProgressiveStatus::Pass1x),
+                            JxlBytesNeeded::LowerBound(2)
+                        );
+                    }
+                    (_, in_visible_frame) = step(&mut decoder, Some(1));
+                    assert!(decoder.frame_progressive_status() >= Some(target));
+                }
+                JxlBytesNeeded::LowerBound(b) => {
+                    assert!(b >= 1);
+                    if b > 1 {
+                        (ev, _) = step(&mut decoder, Some(b - 1));
+                        assert!(matches!(ev, Event::NeedMoreInput { .. }));
+                        assert!(decoder.frame_progressive_status() < Some(target));
+                    }
+                    (_, in_visible_frame) = step(&mut decoder, Some(1));
+                }
+                JxlBytesNeeded::Unknown => {
+                    assert!(!(expect_exact && in_visible_frame));
+                    (_, in_visible_frame) = step(&mut decoder, None);
+                }
+            }
+        }
+        assert_eq!(
+            decoder.bytes_needed_for_status(target),
+            JxlBytesNeeded::Exact(0)
+        );
+    }
+
+    assert_eq!(
+        decoder.frame_progressive_status(),
+        Some(JxlProgressiveStatus::Pass1x)
+    );
+    seen_statuses
+}
+
+#[test]
+fn test_progressive_status_and_bytes_needed() {
+    for (path, expect_exact, min_milestones) in [
+        ("resources/test/progressive_ac.jxl", false, 3),
+        (
+            "resources/test/conformance_test_images/progressive.jxl",
+            true,
+            3,
+        ),
+        ("resources/test/basic.jxl", true, 1),
+        (
+            "resources/test/conformance_test_images/bicycles.jxl",
+            true,
+            2,
+        ),
+        ("resources/test/has_permutation.jxl", true, 1),
+        (
+            "resources/test/has_permutation_with_container.jxl",
+            false,
+            1,
+        ),
+        ("resources/test/ooo_jxlp_empty_dc_group_boxes.jxl", false, 1),
+        ("resources/test/conformance_test_images/bike.jxl", true, 2),
+    ] {
+        let data = std::fs::read(path).unwrap();
+        let seen = check_progressive_stepping(&data, expect_exact);
+        assert!(
+            seen.len() >= min_milestones,
+            "{path}: expected at least {min_milestones} milestones, got {seen:?}"
+        );
+    }
+
+    let prog = std::fs::read("resources/test/conformance_test_images/progressive.jxl").unwrap();
+    let chunked = wrap_with_jxlp_chunks(&prog, &[0, 50, 200, 600, 1500]);
+    assert!(check_progressive_stepping(&chunked, false).len() >= 3);
 }

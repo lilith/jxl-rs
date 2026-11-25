@@ -6,7 +6,7 @@
 use crate::api::{JxlColorType, JxlDataFormat, JxlOutputBuffer};
 use crate::error::{Error, Result};
 use crate::headers::Orientation;
-use crate::image::DataTypeTag;
+use crate::image::{DataTypeTag, Rect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveChannelType {
@@ -31,6 +31,7 @@ pub struct SaveStage {
     pub(super) channel_types: Vec<SaveChannelType>,
     pub(super) orientation: Orientation,
     pub(super) output_buffer_index: usize,
+    pub(super) output_viewport: Option<Rect>,
     pub(super) color_type: JxlColorType,
     pub(super) data_format: JxlDataFormat,
     /// When true, fill alpha channel with opaque (1.0) values.
@@ -46,6 +47,7 @@ impl SaveStage {
         mut color_type: JxlColorType,
         data_format: JxlDataFormat,
         fill_opaque_alpha: bool,
+        output_viewport: Option<Rect>,
     ) -> SaveStage {
         let mut channels = channels.to_vec();
         if color_type == JxlColorType::Bgr {
@@ -62,6 +64,7 @@ impl SaveStage {
             channel_types,
             orientation,
             output_buffer_index,
+            output_viewport,
             color_type,
             data_format,
             fill_opaque_alpha,
@@ -79,6 +82,10 @@ impl SaveStage {
     /// Returns the number of output channels (including filled alpha if applicable)
     pub fn output_channels(&self) -> usize {
         self.color_type.samples_per_pixel()
+    }
+
+    pub fn bytes_per_pixel(&self) -> usize {
+        self.data_format.bytes_per_pixel(self.color_type)
     }
 
     pub fn uses_channel(&self, c: usize) -> bool {
@@ -100,8 +107,7 @@ impl SaveStage {
         };
         let osize = self.orientation.map_size(size);
 
-        let expected_w = self.output_channels() * self.data_format.bytes_per_sample() * osize.0;
-
+        let expected_w = self.bytes_per_pixel() * osize.0;
         if buf.byte_size() != (expected_w, osize.1) {
             return Err(Error::InvalidOutputBufferSize(
                 buf.byte_size().0,

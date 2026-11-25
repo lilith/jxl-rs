@@ -208,13 +208,6 @@ pub fn perform_blending(
     let num_ec = extra_channel_info.len();
     let xsize = bg[0].len();
 
-    // Fast path: if color is None (keep bg) and all ec are None, nothing to do.
-    if color_blending.mode == PatchBlendMode::None
-        && ec_blending.iter().all(|b| b.mode == PatchBlendMode::None)
-    {
-        return;
-    }
-
     // Fast path: Replace color + Replace/None ec -> copy fg directly to bg, no tmp needed.
     if color_blending.mode == PatchBlendMode::Replace {
         let all_simple = ec_blending[..num_ec]

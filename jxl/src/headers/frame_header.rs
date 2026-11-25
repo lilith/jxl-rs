@@ -11,6 +11,7 @@ use jxl_macros::UnconditionalCoder;
 use num_derive::FromPrimitive;
 
 use super::Animation;
+use crate::api::JxlProgressiveStatus;
 use crate::bit_reader::BitReader;
 use crate::error::Error;
 use crate::headers::encodings::*;
@@ -74,11 +75,11 @@ pub struct Passes {
 }
 
 impl Passes {
-    pub fn downsampling_bracket(&self, pass: usize) -> (usize, usize) {
-        let mut max_shift = 3;
+    fn bracket(&self, pass: usize) -> (u32, u32, bool, bool) {
         let mut min_shift = 3;
-        for i in 0..=pass {
-            max_shift = min_shift;
+        let mut is_start = true;
+        for i in 0..self.num_passes as usize {
+            let max_shift = min_shift;
             let mut found = false;
             for j in 0..self.num_ds as usize {
                 if i == self.last_pass[j] as usize {
@@ -90,14 +91,41 @@ impl Passes {
                 min_shift = 0;
                 found = true;
             }
+            if i >= pass && found {
+                return (min_shift, max_shift, i == pass, is_start);
+            }
             if !found {
                 min_shift = max_shift;
             }
+            if i < pass {
+                is_start = found;
+            }
         }
-        if min_shift < max_shift {
+        unreachable!()
+    }
+
+    pub fn downsampling_bracket(&self, pass: usize) -> (usize, usize) {
+        let (min_shift, max_shift, is_end, _) = self.bracket(pass);
+        if is_end && min_shift < max_shift {
             (min_shift as usize, (max_shift - 1) as usize)
         } else {
             (1, 0)
+        }
+    }
+
+    /// Returns the progressive status reached when HF pass `pass` (in `0..num_passes`)
+    /// completes across all groups, if `pass` completes a progressive milestone.
+    pub fn pass_status(&self, pass: usize) -> Option<JxlProgressiveStatus> {
+        let (min_shift, _, is_end, is_start) = self.bracket(pass);
+        match (min_shift, is_end, is_start) {
+            (3, true, _) => Some(JxlProgressiveStatus::Pass8x),
+            (2, true, _) => Some(JxlProgressiveStatus::Pass4x),
+            (2, false, true) => Some(JxlProgressiveStatus::Pass4xSalient),
+            (1, true, _) => Some(JxlProgressiveStatus::Pass2x),
+            (1, false, true) => Some(JxlProgressiveStatus::Pass2xSalient),
+            (0, true, _) => Some(JxlProgressiveStatus::Pass1x),
+            (0, false, true) => Some(JxlProgressiveStatus::Pass1xSalient),
+            _ => None,
         }
     }
 }
@@ -443,12 +471,12 @@ pub struct FrameHeader {
     // The following fields are not actually serialized, but just used as variables for
     // implementing the methods below.
     #[coder(Bits(0))]
-    #[default(if frame_width == 0 { nonserialized.img_width } else { frame_width })]
+    #[default(if !have_crop { nonserialized.img_width } else { frame_width })]
     #[condition(false)]
     pub width: u32,
 
     #[coder(Bits(0))]
-    #[default(if frame_height == 0 { nonserialized.img_height } else { frame_height })]
+    #[default(if !have_crop { nonserialized.img_height } else { frame_height })]
     #[condition(false)]
     pub height: u32,
 
@@ -558,6 +586,44 @@ impl FrameHeader {
                 .iter()
                 .all(|x| x.mode == BlendingMode::Replace);
         self.have_crop || !replace_all
+    }
+
+    pub fn needs_full_resolution_save(&self) -> bool {
+        self.frame_type == FrameType::LFFrame || (self.can_be_referenced && self.save_before_ct)
+    }
+
+    pub fn feature_rendering_shift(
+        &self,
+        color_upsampling_shift: u32,
+        requested_shift: u32,
+        extra_channel_info: &[ExtraChannelInfo],
+    ) -> u32 {
+        if self.needs_full_resolution_save()
+            || self.needs_full_resolution_blending(extra_channel_info)
+        {
+            color_upsampling_shift
+        } else {
+            requested_shift.max(color_upsampling_shift)
+        }
+    }
+
+    pub fn needs_full_resolution_blending(&self, extra_channel_info: &[ExtraChannelInfo]) -> bool {
+        let ec_blending_with_alpha = self
+            .ec_blending_info
+            .iter()
+            .enumerate()
+            .filter(|(ec, info)| *ec != info.alpha_channel as usize)
+            .map(|(_, info)| info);
+        self.num_extra_channels != 0
+            && self.needs_blending()
+            && std::iter::once(&self.blending_info)
+                .chain(ec_blending_with_alpha)
+                .any(|info| {
+                    // Blend with premultiplied alpha doesn't require alpha-weighted downsampling.
+                    info.mode == BlendingMode::AlphaWeightedAdd
+                        || (info.mode == BlendingMode::Blend
+                            && !extra_channel_info[info.alpha_channel as usize].alpha_associated())
+                })
     }
 
     /// The dimensions of this frame, as coded in the codestream, excluding padding pixels.
@@ -676,6 +742,21 @@ impl FrameHeader {
     }
 
     fn check(&self, nonserialized: &FrameHeaderNonserialized) -> Result<(), Error> {
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::InvalidImageSize(
+                self.width as usize,
+                self.height as usize,
+            ));
+        }
+
+        if self.width > (1 << 30)
+            || self.height > (1 << 30)
+            || (self.width as u64) * (self.height as u64) > (1 << 40)
+        {
+            return Err(Error::ImageDimensionTooLarge(
+                self.width.max(self.height) as u64
+            ));
+        }
         if let Some((dim_shift, effective_upsampling)) = nonserialized
             .extra_channel_info
             .iter()
@@ -911,5 +992,30 @@ mod test_frame_header {
         assert_eq!(frame_header.frame_type, FrameType::RegularFrame);
         assert_eq!(frame_header.name, "TestFrameName");
         assert_eq!(frame_header.name.len(), 13);
+    }
+
+    #[test]
+    fn test_frame_dimension_checks() {
+        let (file_header, mut fh, _) =
+            read_headers_and_toc(include_bytes!("../../resources/test/basic.jxl")).unwrap();
+        let nonserialized = file_header.frame_header_nonserialized();
+
+        for (w, h) in [(0, 8), (8, 0)] {
+            fh.width = w;
+            fh.height = h;
+            assert!(matches!(
+                fh.check(&nonserialized),
+                Err(Error::InvalidImageSize(_, _))
+            ));
+        }
+
+        for (w, h) in [((1 << 30) + 1, 1), (1 << 21, 1 << 20)] {
+            fh.width = w;
+            fh.height = h;
+            assert!(matches!(
+                fh.check(&nonserialized),
+                Err(Error::ImageDimensionTooLarge(_))
+            ));
+        }
     }
 }

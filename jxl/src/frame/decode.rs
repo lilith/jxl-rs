@@ -17,7 +17,6 @@ use super::modular::{
 };
 use super::quant_weights::DequantMatrices;
 use super::quantizer::{LfQuantFactors, QuantizerParams};
-use super::render::pipeline;
 use super::{HfMetaSplitter, HfMetaViews, LfImageSplitter};
 use crate::bit_reader::BitReader;
 use crate::entropy_coding::decode::Histograms;
@@ -28,7 +27,6 @@ use crate::features::patches::PatchesDictionary;
 use crate::features::spline::Splines;
 use crate::frame::block_context_map::{ZERO_DENSITY_CONTEXT_COUNT, ZERO_DENSITY_CONTEXT_LIMIT};
 use crate::frame::group::VarDctBuffers;
-use crate::frame::modular::ModularStorage;
 use crate::frame::{
     DataStatus, DecoderState, Frame, GroupStatus, HfGlobalState, HfMetadata, LfGlobalState,
     PassState, coeff_order,
@@ -37,16 +35,14 @@ use crate::headers::CustomTransformData;
 use crate::headers::color_encoding::ColorSpace;
 use crate::headers::frame_header::{Encoding, FrameHeader, FrameType};
 use crate::headers::toc::Toc;
-use crate::image::{BufferRecycler, DataTypeTag, Image, OwnedRawImage, Rect};
-#[cfg(test)]
-use crate::render::SimpleRenderPipeline;
+use crate::image::{BufferRecycler, DataTypeTag, Image, Rect};
 use crate::render::buffer_splitter::BufferSplitter;
 use crate::render::low_memory_pipeline::row_buffers::RowBuffer;
 use crate::render::stages::Upsample8x;
-use crate::render::{Channels, ChannelsMut, RenderPipeline, RenderPipelineInOutStage};
-use crate::util::sync::{Arc, Mutex, RwLock};
+use crate::render::{Channels, ChannelsMut, RenderPipelineInOutStage};
+use crate::util::sync::{Arc, Mutex};
 use crate::util::tracing_wrappers::*;
-use crate::util::{CeilLog2, ShiftRightCeil, Xorshift128Plus, mirror};
+use crate::util::{CeilLog2, SharedSnapshot, ShiftRightCeil, Xorshift128Plus, mirror};
 
 fn upsample_lf_group(
     group: usize,
@@ -216,20 +212,23 @@ impl Frame {
             && image_metadata.color_encoding.color_space == ColorSpace::Gray;
         let color_channels = if is_gray { 1 } else { 3 };
         let size_blocks = frame_header.size_blocks();
-        let lf_image = if frame_header.encoding == Encoding::VarDCT {
-            if frame_header.has_lf_frame() {
-                if decoder_state.lf_frames[frame_header.lf_level as usize].is_none() {
-                    return Err(Error::NoLfFrame(frame_header.lf_level));
-                } else {
-                    None
-                }
-            } else {
-                Some([
-                    Image::new(size_blocks)?,
-                    Image::new(size_blocks)?,
-                    Image::new(size_blocks)?,
-                ])
+        let lf_image = if frame_header.has_lf_frame() {
+            if !decoder_state.lf_frames[frame_header.lf_level as usize]
+                .as_ref()
+                .is_some_and(|lf| {
+                    lf.iter()
+                        .all(|ch| ch.size().0 >= size_blocks.0 && ch.size().1 >= size_blocks.1)
+                })
+            {
+                return Err(Error::NoLfFrame(frame_header.lf_level));
             }
+            None
+        } else if frame_header.encoding == Encoding::VarDCT {
+            Some([
+                Image::new(size_blocks)?,
+                Image::new(size_blocks)?,
+                Image::new(size_blocks)?,
+            ])
         } else {
             None
         };
@@ -251,14 +250,19 @@ impl Frame {
         };
 
         let reference_frame_data = if frame_header.can_be_referenced {
-            let image_size = &decoder_state.file_header.size;
-            let image_size = (image_size.xsize() as usize, image_size.ysize() as usize);
+            let image_size = decoder_state.file_header.codestream_image_size();
             let sz = if frame_header.save_before_ct {
                 frame_header.size_upsampled()
             } else {
                 image_size
             };
 
+            let reference_shift = if frame_header.needs_full_resolution_save() {
+                0
+            } else {
+                decoder_state.output_downsampling_shift
+            };
+            let sz = (sz.0.shrc(reference_shift), sz.1.shrc(reference_shift));
             let num_ref_channels = 3 + image_metadata.extra_channel_info.len();
             Some(
                 (0..num_ref_channels)
@@ -300,12 +304,16 @@ impl Frame {
             reference_frame_data,
             lf_frame_data,
             section0_render_up_to_date: false,
-            patches: Arc::new(RwLock::new(PatchesDictionary::new(num_extra_channels))),
-            splines: Arc::new(RwLock::new(Splines::default())),
-            noise: Arc::new(RwLock::new(Noise::default())),
-            lf_quant: Arc::new(RwLock::new(LfQuantFactors::default())),
-            color_correlation_params: Arc::new(RwLock::new(ColorCorrelationParams::default())),
-            epf_sigma: Arc::new(RwLock::new(SigmaSource::default())),
+            patches: Arc::new(SharedSnapshot::new(PatchesDictionary::new(
+                num_extra_channels,
+            ))),
+            splines: Arc::new(SharedSnapshot::new(Splines::default())),
+            noise: Arc::new(SharedSnapshot::new(Noise::default())),
+            lf_quant: Arc::new(SharedSnapshot::new(LfQuantFactors::default())),
+            color_correlation_params: Arc::new(SharedSnapshot::new(
+                ColorCorrelationParams::default(),
+            )),
+            epf_sigma: Arc::new(SharedSnapshot::new(SigmaSource::default())),
             dirty_lf_groups: BTreeSet::new(),
             buffer_recycler,
             lf_preview_dirty_groups: BTreeSet::new(),
@@ -336,6 +344,13 @@ impl Frame {
             br.skip_bits(lfg.total_bits_read)?;
         } else {
             trace!(pos = br.total_bits_read());
+            let upsampling_shift = self.header.upsampling.ilog2();
+            let feature_rendering_shift = self.header.feature_rendering_shift(
+                upsampling_shift,
+                self.decoder_state.output_downsampling_shift,
+                self.decoder_state.extra_channel_info(),
+            );
+            let additional_feature_shift = feature_rendering_shift - upsampling_shift;
 
             if self.header.has_patches() {
                 info!("decoding patches");
@@ -344,31 +359,34 @@ impl Frame {
                     self.header.size_padded().0,
                     self.header.size_padded().1,
                     self.decoder_state.extra_channel_info().len(),
+                    additional_feature_shift as usize,
                     &self.decoder_state.reference_frames[..],
                     self.decoder_state.level5_limits,
                     &mut self.buffer_recycler.modular_scratch.get().lz77_window,
                 )?;
-                *self.patches.try_write().unwrap() = p;
+                self.patches.set(p);
             }
 
+            let mut decoded_splines = None;
             if self.header.has_splines() {
                 info!("decoding splines");
                 let s = Splines::read(
                     br,
-                    self.header.width * self.header.height,
+                    (self.header.width as u64) * (self.header.height as u64),
                     &mut self.buffer_recycler.modular_scratch.get().lz77_window,
                 )?;
-                *self.splines.try_write().unwrap() = s;
+                // Published below, once the draw cache has been initialized.
+                decoded_splines = Some(s);
             }
 
             if self.header.has_noise() {
                 info!("decoding noise");
                 let n = Noise::read(br)?;
-                *self.noise.try_write().unwrap() = n;
+                self.noise.set(n);
             }
 
             let lf_quant = LfQuantFactors::new(br)?;
-            *self.lf_quant.try_write().unwrap() = lf_quant.clone();
+            self.lf_quant.set(lf_quant.clone());
             debug!(?lf_quant);
 
             let quant_params = if self.header.encoding == Encoding::VarDCT {
@@ -393,7 +411,7 @@ impl Frame {
             let color_correlation_params = if self.header.encoding == Encoding::VarDCT {
                 info!("decoding color correlation params");
                 let ccp = ColorCorrelationParams::read(br)?;
-                *self.color_correlation_params.try_write().unwrap() = ccp;
+                self.color_correlation_params.set(ccp);
                 Some(ccp)
             } else {
                 None
@@ -401,24 +419,28 @@ impl Frame {
             debug!(?color_correlation_params);
 
             // Validate spline parameters
-            if self.header.has_splines() {
-                let color_correlation_params = self.color_correlation_params.try_read().unwrap();
-                self.splines.try_write().unwrap().initialize_draw_cache(
+            if let Some(mut splines) = decoded_splines {
+                let color_correlation_params = self.color_correlation_params.get();
+                splines.initialize_draw_cache(
                     self.header.size().0 as u64,
                     self.header.size().1 as u64,
                     &color_correlation_params,
                     self.decoder_state.high_precision,
                     self.decoder_state.level5_limits,
+                    additional_feature_shift as usize,
                 )?;
+                self.splines.set(splines);
             }
 
             let tree = if br.read(1)? == 1 {
+                let channels =
+                    (self.color_channels + self.decoder_state.extra_channel_info().len()) as u64;
                 let size_limit = (1024
-                    + self.header.width as usize
-                        * self.header.height as usize
-                        * (self.color_channels + self.decoder_state.extra_channel_info().len())
+                    + (self.header.width as u64)
+                        .saturating_mul(self.header.height as u64)
+                        .saturating_mul(channels)
                         / 16)
-                    .min(1 << 22);
+                    .min(1 << 22) as usize;
                 Some(Tree::read(
                     br,
                     size_limit,
@@ -551,6 +573,11 @@ impl Frame {
         self.dirty_lf_groups.insert(group);
         let lf_global = self.lf_global.as_mut().unwrap();
         lf_global.modular_global.mark_final(1, group);
+        self.group_status.remaining_lf_groups =
+            self.group_status.remaining_lf_groups.saturating_sub(1);
+        if self.group_status.remaining_lf_groups == 0 && self.header.encoding == Encoding::Modular {
+            self.mark_lf_done();
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -630,13 +657,24 @@ impl Frame {
                 use_i16,
             });
         }
+
         // Set EPF sigma values to the correct values if we are doing EPF.
-        if self.header.restoration_filter.epf_iters > 0 {
-            *self.epf_sigma.try_write().unwrap() = SigmaSource::new(
+        let upsampling_shift = self.header.upsampling.ilog2();
+        let feature_rendering_shift = self.header.feature_rendering_shift(
+            upsampling_shift,
+            self.decoder_state.output_downsampling_shift,
+            self.decoder_state.extra_channel_info(),
+        );
+        let can_render_features = feature_rendering_shift == upsampling_shift;
+        if self.header.restoration_filter.epf_iters > 0 && can_render_features {
+            self.epf_sigma.set(SigmaSource::new(
                 &self.header,
                 self.lf_global.as_ref().unwrap(),
                 &self.hf_meta,
-            )?;
+            )?);
+        }
+        if self.header.encoding == Encoding::VarDCT {
+            self.mark_lf_done();
         }
         Ok(())
     }
@@ -664,11 +702,15 @@ impl Frame {
         let buf_ysize = buf_y1.min(upsampled_size.1) - (gy * upsampling * group_dim) as usize;
 
         // Get all 3 noise channel buffers upfront
-        let mut bufs: [Image<u16>; 3] = [
-            pipeline!(self, p, p.get_buffer(num_channels)?),
-            pipeline!(self, p, p.get_buffer(num_channels + 1)?),
-            pipeline!(self, p, p.get_buffer(num_channels + 2)?),
-        ];
+        let noise_buffer = || {
+            let group_dim = (group_dim * upsampling) as usize;
+            // Noise channels are not downsampled.
+            self.buffer_recycler.get_buffer::<u16>((
+                group_dim.min(upsampled_size.0).next_multiple_of(16),
+                group_dim.min(upsampled_size.1).next_multiple_of(16),
+            ))
+        };
+        let mut bufs: [Image<u16>; 3] = [noise_buffer()?, noise_buffer()?, noise_buffer()?];
 
         // libjxl iterates through upsampling subdivisions with separate RNG seeds.
         // For each subregion, a single RNG is shared across all 3 channels.
@@ -710,23 +752,16 @@ impl Frame {
             }
         }
 
-        // Set all buffers after filling
-        let [buf0, buf1, buf2] = bufs;
-        pipeline!(
-            self,
-            p,
-            p.set_buffer_for_group(num_channels, group, complete, buf0, buffer_splitter)?
-        );
-        pipeline!(
-            self,
-            p,
-            p.set_buffer_for_group(num_channels + 1, group, complete, buf1, buffer_splitter)?
-        );
-        pipeline!(
-            self,
-            p,
-            p.set_buffer_for_group(num_channels + 2, group, complete, buf2, buffer_splitter)?
-        );
+        for (c, buffer) in bufs.into_iter().enumerate() {
+            self.set_render_input(
+                num_channels + c,
+                group,
+                complete,
+                (0, 0),
+                buffer,
+                buffer_splitter,
+            )?;
+        }
         Ok(())
     }
 
@@ -757,7 +792,13 @@ impl Frame {
             return Ok(());
         }
 
-        if self.header.has_noise() && render_vardct {
+        let should_render_noise = self.header.needs_full_resolution_save()
+            || self
+                .header
+                .needs_full_resolution_blending(self.decoder_state.extra_channel_info())
+            || self.decoder_state.output_downsampling_shift == 0;
+
+        if self.header.has_noise() && should_render_noise && render_vardct {
             self.render_noise_for_group(group, complete, buffer_splitter)?;
         }
 
@@ -766,12 +807,29 @@ impl Frame {
         }
 
         let lf_global = self.lf_global.as_ref().unwrap();
+        let upsampling_shift = self.header.upsampling.ilog2() as usize;
+        let decoded_shifts: [_; 3] = std::array::from_fn(|c| {
+            (
+                upsampling_shift + self.header.hshift(c),
+                upsampling_shift + self.header.vshift(c),
+            )
+        });
+        let decoded_buffer = |c: usize| {
+            let size = self.header.size_upsampled();
+            let group_dim = 1 << (self.header.log_group_dim() + upsampling_shift);
+            self.buffer_recycler.get_buffer::<f32>((
+                group_dim
+                    .min(size.0)
+                    .shrc(decoded_shifts[c].0)
+                    .next_multiple_of(16),
+                group_dim
+                    .min(size.1)
+                    .shrc(decoded_shifts[c].1)
+                    .next_multiple_of(16),
+            ))
+        };
         let mut pixels = if render_vardct {
-            Some([
-                pipeline!(self, p, p.get_buffer(0))?,
-                pipeline!(self, p, p.get_buffer(1))?,
-                pipeline!(self, p, p.get_buffer(2))?,
-            ])
+            Some([decoded_buffer(0)?, decoded_buffer(1)?, decoded_buffer(2)?])
         } else {
             None
         };
@@ -818,13 +876,10 @@ impl Frame {
                 &mut vardct_buffers,
             )?;
         }
+
         if let Some(pixels) = pixels {
             for (c, img) in pixels.into_iter().enumerate() {
-                pipeline!(
-                    self,
-                    p,
-                    p.set_buffer_for_group(c, group, complete, img, buffer_splitter)?
-                );
+                self.set_render_input(c, group, complete, decoded_shifts[c], img, buffer_splitter)?;
             }
         }
 
@@ -846,27 +901,15 @@ impl Frame {
         self.decode_and_render_varct_and_noise(group, passes, buffer_splitter, force_render)?;
 
         let lf_global = self.lf_global.as_ref().unwrap();
-        let storage = lf_global.modular_global.storage();
-        let pass_to_pipeline = |chan, group, complete, raw_image: OwnedRawImage| {
-            match storage {
-                ModularStorage::I16 => {
-                    let image = Image::<i16>::from_raw(raw_image);
-                    pipeline!(
-                        self,
-                        p,
-                        p.set_buffer_for_group(chan, group, complete, image, &*buffer_splitter)?
-                    );
-                }
-                ModularStorage::I32 => {
-                    let image = Image::<i32>::from_raw(raw_image);
-                    pipeline!(
-                        self,
-                        p,
-                        p.set_buffer_for_group(chan, group, complete, image, &*buffer_splitter)?
-                    );
-                }
-            }
-            Ok(())
+        let pass_to_pipeline = |chan, group, complete, decoded_shift, raw_image| {
+            self.set_modular_render_input(
+                chan,
+                group,
+                complete,
+                decoded_shift,
+                raw_image,
+                buffer_splitter,
+            )
         };
 
         for (pass, br) in passes.iter_mut() {

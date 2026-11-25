@@ -13,6 +13,32 @@ macro_rules! declare_test_file_common {
                 crate::tests::decode::decode::<f32>(&file, Default::default()).unwrap();
             }
 
+            fn [<compare_crop_downsampled_ $ident>](downsample_factor: u8) {
+                let path = std::path::Path::new("resources/test/").join($path);
+                let file = std::fs::read(&path).unwrap();
+                crate::tests::compare_crop::run(&file, downsample_factor);
+            }
+
+            #[test]
+            fn [<test_compare_crop_ $ident>]() {
+                [<compare_crop_downsampled_ $ident>](0)
+            }
+
+            #[test]
+            fn [<test_compare_crop_downsampled_1_ $ident>]() {
+                [<compare_crop_downsampled_ $ident>](1)
+            }
+
+            #[test]
+            fn [<test_compare_crop_downsampled_2_ $ident>]() {
+                [<compare_crop_downsampled_ $ident>](2)
+            }
+
+            #[test]
+            fn [<test_compare_crop_downsampled_3_ $ident>]() {
+                [<compare_crop_downsampled_ $ident>](3)
+            }
+
             #[test]
             fn [<test_decode_test_file_chunks_ $ident>]() {
                 let path = std::path::Path::new("resources/test/").join($path);
@@ -55,18 +81,65 @@ macro_rules! declare_test_file_common {
                 crate::tests::decode::scan_frames(&file, 1);
             }
 
-            #[test]
-            fn [<test_compare_pipelines_ $ident>]() {
+            fn [<compare_pipelines_downsampled_ $ident>](downsample_factor: u8) {
+                use crate::tests::decode;
+
                 let path = std::path::Path::new("resources/test/").join($path);
                 let file = std::fs::read(&path).unwrap();
-                let simple_frames = crate::tests::decode::decode(&file, crate::tests::decode::DecodeParams {
+                let simple_frames = decode::decode(&file, decode::DecodeParams {
                     use_simple_pipeline: true,
+                    downsample_factor,
                     ..Default::default()
                 }).unwrap();
-                let frames = crate::tests::decode::decode(&file, Default::default()).unwrap();
+                let frames = decode::decode(&file, decode::DecodeParams {
+                    downsample_factor,
+                    ..Default::default()
+                }).unwrap();
                 assert_eq!(frames.len(), simple_frames.len());
                 for (fc, (f, sf)) in frames.into_iter().zip(simple_frames).enumerate() {
                     crate::tests::decode::compare_frames(&path, fc, &f, &sf);
+                }
+            }
+
+            #[test]
+            fn [<test_compare_pipelines_ $ident>]() {
+                [<compare_pipelines_downsampled_ $ident>](0)
+            }
+
+            #[test]
+            fn [<test_compare_pipelines_downsampled_1_ $ident>]() {
+                [<compare_pipelines_downsampled_ $ident>](1)
+            }
+
+            #[test]
+            fn [<test_compare_pipelines_downsampled_2_ $ident>]() {
+                [<compare_pipelines_downsampled_ $ident>](2)
+            }
+
+            #[test]
+            fn [<test_compare_pipelines_downsampled_3_ $ident>]() {
+                [<compare_pipelines_downsampled_ $ident>](3)
+            }
+
+            #[test]
+            fn [<test_decode_callback_ $ident>]() {
+                let path = std::path::Path::new("resources/test/").join($path);
+                let file = std::fs::read(&path).unwrap();
+                let frames = crate::tests::decode::decode(&file, Default::default()).unwrap();
+                for use_simple in [false, true] {
+                    let cb_frames = crate::tests::decode::decode(&file, crate::tests::decode::DecodeParams {
+                        use_callback: true,
+                        use_simple_pipeline: use_simple,
+                        #[cfg(not(any(target_family = "wasm", target_arch = "wasm32")))]
+                        parallel_runner: Some(&mut crate::tests::parallel_runner::TestParallelRunner {
+                            max_threads: 4,
+                        }),
+                        ..Default::default()
+                    }).unwrap();
+                    assert_eq!(frames.len(), cb_frames.len());
+                    for (fc, (f, cf)) in frames.iter().zip(&cb_frames).enumerate() {
+                        crate::tests::decode::compare_frames(&path, fc, f, cf);
+                    }
                 }
             }
 

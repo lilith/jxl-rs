@@ -6,9 +6,11 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use jxl_simd::{F32SimdVec, SimdDescriptor, SimdMask, U8SimdVec, simd_function};
+
 use crate::bit_reader::BitReader;
 use crate::color::tf::{
-    hlg_system_gamma, hlg_to_scene, linear_to_pq_simd_vec, pq_to_linear_precise,
+    hlg_to_scene, linear_to_pq_simd_vec, pq_to_linear_precise, pq_to_linear_simd_vec,
 };
 use crate::error::{Error, Result};
 pub use crate::headers::color_encoding::RenderingIntent;
@@ -17,7 +19,9 @@ use crate::headers::color_encoding::{
 };
 use crate::headers::encodings::{Empty, UnconditionalCoder};
 use crate::icc::IncrementalIccReader;
-use crate::util::{Matrix3x3, Vector3, inv_3x3_matrix, mul_3x3_matrix, mul_3x3_vector};
+use crate::util::{
+    Matrix3x3, Vector3, fast_powf_simd, inv_3x3_matrix, mul_3x3_matrix, mul_3x3_vector,
+};
 
 // Bradford matrices for chromatic adaptation
 const K_BRADFORD: Matrix3x3<f64> = [
@@ -71,35 +75,34 @@ pub fn compute_md5(data: &[u8]) -> [u8; 16] {
     let mut c0: u32 = 0x98badcfe;
     let mut d0: u32 = 0x10325476;
 
-    for i in (0..data64.len()).step_by(64) {
+    for block in data64.chunks_exact(64) {
+        let words: [u32; 16] = std::array::from_fn(|i| {
+            u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap())
+        });
         let mut a = a0;
         let mut b = b0;
         let mut c = c0;
         let mut d = d0;
 
-        for j in 0..64 {
-            let (f, g) = if j < 16 {
-                ((b & c) | ((!b) & d), j)
-            } else if j < 32 {
-                ((d & b) | ((!d) & c), (5 * j + 1) & 0xf)
-            } else if j < 48 {
-                (b ^ c ^ d, (3 * j + 5) & 0xf)
-            } else {
-                (c ^ (b | (!d)), (7 * j) & 0xf)
+        // One loop per round, so that each loop has a fixed function and unrolls.
+        macro_rules! round {
+            ($j:ident in $steps:expr, $f:expr, $g:expr) => {
+                for $j in $steps {
+                    let f = ($f)
+                        .wrapping_add(a)
+                        .wrapping_add(SINEPARTS[$j])
+                        .wrapping_add(words[$g]);
+                    a = d;
+                    d = c;
+                    c = b;
+                    b = b.wrapping_add(f.rotate_left(SHIFT[$j]));
+                }
             };
-
-            let dg0 = data64[i + g * 4] as u32;
-            let dg1 = data64[i + g * 4 + 1] as u32;
-            let dg2 = data64[i + g * 4 + 2] as u32;
-            let dg3 = data64[i + g * 4 + 3] as u32;
-            let u = dg0 | (dg1 << 8) | (dg2 << 16) | (dg3 << 24);
-
-            let f = f.wrapping_add(a).wrapping_add(SINEPARTS[j]).wrapping_add(u);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f.rotate_left(SHIFT[j]));
         }
+        round!(j in 0..16, (b & c) | (!b & d), j);
+        round!(j in 16..32, (d & b) | (!d & c), (5 * j + 1) & 0xf);
+        round!(j in 32..48, b ^ c ^ d, (3 * j + 5) & 0xf);
+        round!(j in 48..64, c ^ (b | !d), (7 * j) & 0xf);
 
         a0 = a0.wrapping_add(a);
         b0 = b0.wrapping_add(b);
@@ -712,14 +715,7 @@ impl JxlColorEncoding {
         write_icc_tag(&mut header_data, 16, data_color_space_str)?;
 
         // PCS - Profile Connection Space
-        // Corresponds to: if (kEnable3DToneMapping && CanToneMap(c))
-        // Assuming kEnable3DToneMapping is true for this port for now.
-        const K_ENABLE_3D_ICC_TONEMAPPING: bool = true;
-        if K_ENABLE_3D_ICC_TONEMAPPING && self.can_tone_map_for_icc() {
-            write_icc_tag(&mut header_data, 20, "Lab ")?;
-        } else {
-            write_icc_tag(&mut header_data, 20, "XYZ ")?;
-        }
+        write_icc_tag(&mut header_data, 20, "XYZ ")?;
 
         // Date and Time - Placeholder values from libjxl
         write_u16_be(&mut header_data, 24, 2019)?; // Year
@@ -814,7 +810,7 @@ impl JxlColorEncoding {
         Ok(())
     }
 
-    pub fn maybe_create_profile(&self) -> Result<Option<Vec<u8>>, Error> {
+    pub fn maybe_create_profile(&self, intensity_target: f32) -> Result<Option<Vec<u8>>, Error> {
         if let JxlColorEncoding::XYB { rendering_intent } = self
             && *rendering_intent != RenderingIntent::Perceptual
         {
@@ -960,6 +956,7 @@ impl JxlColorEncoding {
             {
                 let a2b0_start = tags_data.len() as u32;
                 create_icc_lut_atob_tag_for_hdr(
+                    intensity_target,
                     transfer_function,
                     primaries,
                     white_point,
@@ -1258,7 +1255,7 @@ impl JxlColorProfile {
         }
 
         let mut reader = BitReader::new(encoded_icc);
-        let mut icc = IncrementalIccReader::new(&mut reader)?;
+        let mut icc = IncrementalIccReader::new(&mut reader, false)?;
         while icc.remaining() != 0 {
             icc.read_one(&mut reader)?;
         }
@@ -1275,21 +1272,26 @@ impl JxlColorProfile {
     /// # Panics
     /// Panics if the color encoding cannot generate an ICC profile.
     /// Consider using `try_as_icc` for fallible conversion.
-    pub fn as_icc(&self) -> Cow<'_, Vec<u8>> {
+    pub fn as_icc(&self, intensity_target: f32) -> Cow<'_, Vec<u8>> {
         match self {
             Self::Icc(x) => Cow::Borrowed(x),
-            Self::Simple(encoding) => Cow::Owned(encoding.maybe_create_profile().unwrap().unwrap()),
+            Self::Simple(encoding) => Cow::Owned(
+                encoding
+                    .maybe_create_profile(intensity_target)
+                    .unwrap()
+                    .unwrap(),
+            ),
         }
     }
 
     /// Attempts to get an ICC profile, returning None if unavailable.
     ///
     /// Returns `None` for color encodings that cannot generate ICC profiles.
-    pub fn try_as_icc(&self) -> Option<Cow<'_, Vec<u8>>> {
+    pub fn try_as_icc(&self, intensity_target: f32) -> Option<Cow<'_, Vec<u8>>> {
         match self {
             Self::Icc(x) => Some(Cow::Borrowed(x)),
             Self::Simple(encoding) => encoding
-                .maybe_create_profile()
+                .maybe_create_profile(intensity_target)
                 .ok()
                 .flatten()
                 .map(Cow::Owned),
@@ -1745,34 +1747,64 @@ fn create_icc_lut_atob_tag_for_xyb(tags: &mut Vec<u8>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Create mft1 (8-bit LUT) A2B0 tag for HDR tone mapping.
+const HDR_LUT_DIM: usize = 17;
+/// Linear toe `d` of the type-3 parametric M-curve (`gamma = 2.0`) for PQ HDR profiles.
+const PQ_M_CURVE_TOE: f32 = 0.2;
+/// Highlight compression factor `M = PQ_A_CURVE_M * y_max` for the PQ A-curve.
+const PQ_A_CURVE_M: f32 = 6.0;
+
+#[inline]
+fn eval_hdr_m_curve(u: f32, d: f32) -> f32 {
+    let a = 1.0 / (1.0 + d);
+    let b = d * a;
+    let c = 4.0 * d * a * a;
+    if u < d {
+        c * u
+    } else {
+        let t = a * u + b;
+        t * t
+    }
+}
+
+#[inline]
+fn inv_hdr_m_curve(y: f32, d: f32) -> f32 {
+    let a = 1.0 / (1.0 + d);
+    let c = 4.0 * d * a * a;
+    let yd = c * d;
+    if y <= yd {
+        if c > 0.0 { y / c } else { 0.0 }
+    } else {
+        (1.0 + d) * y.sqrt() - d
+    }
+}
+
+/// Create mAB A2B0 tag for HDR tone mapping.
 fn create_icc_lut_atob_tag_for_hdr(
+    intensity_target: f32,
     transfer_function: &JxlTransferFunction,
     primaries: &JxlPrimaries,
     white_point: &JxlWhitePoint,
     tags: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    const LUT_DIM: usize = 9; // 9x9x9 3D LUT
-
-    // Tag signature: 'mft1'
-    tags.extend_from_slice(b"mft1");
+    // Tag signature: 'mAB '
+    tags.extend_from_slice(b"mAB ");
     // Reserved
     tags.extend_from_slice(&0u32.to_be_bytes());
-    // Number of input channels, output channels, CLUT grid points, padding
-    tags.extend_from_slice(&[3, 3, LUT_DIM as u8, 0]);
+    // Number of input channels, output channels, 2 bytes padding
+    tags.extend_from_slice(&[3, 3, 0, 0]);
+    // Offsets: B curves (32), Matrix (80), M curves (128), CLUT (1796), A curves (224)
+    tags.extend_from_slice(&32u32.to_be_bytes());
+    tags.extend_from_slice(&80u32.to_be_bytes());
+    tags.extend_from_slice(&128u32.to_be_bytes());
+    tags.extend_from_slice(&1796u32.to_be_bytes());
+    tags.extend_from_slice(&224u32.to_be_bytes());
 
-    // Identity matrix (3x3, s15Fixed16)
-    for i in 0..3 {
-        for j in 0..3 {
-            append_s15_fixed_16(tags, if i == j { 1.0 } else { 0.0 })?;
-        }
-    }
-
-    // Input tables (identity, 256 entries per channel)
+    // offset = 32: B curves (3 identity/linear curves, 3 * 16 = 48 bytes)
     for _ in 0..3 {
-        tags.extend(0..=255u8);
+        create_icc_curv_para_tag(tags, &[1.0], 0)?;
     }
 
+    // offset = 80: Matrix (9 matrix values + 3 intercepts = 48 bytes)
     let [(rx, ry), (gx, gy), (bx, by)] = primaries.to_xy_coords();
     let (wx, wy) = white_point.to_xy_coords();
     let primaries_xyz = primaries_to_xyz(rx, ry, gx, gy, bx, by, wx, wy)?;
@@ -1783,97 +1815,251 @@ fn create_icc_lut_atob_tag_for_hdr(
     ];
     let chad = adapt_to_xyz_d50(wx, wy)?;
     let to_xyzd50 = mul_3x3_matrix(&chad, &primaries_xyz);
-    let to_xyzd50: [[f32; 3]; 3] =
-        std::array::from_fn(|r| std::array::from_fn(|c| to_xyzd50[r][c] as f32));
-
-    // Precompute 1D EOTF on the 9 grid coordinates.
-    let mut eotf_lut: [f32; LUT_DIM] = std::array::from_fn(|i| i as f32 / (LUT_DIM - 1) as f32);
-    match transfer_function {
-        JxlTransferFunction::PQ => pq_to_linear_precise(10000.0, &mut eotf_lut),
-        JxlTransferFunction::HLG => hlg_to_scene(&mut eotf_lut),
-        _ => return Err(Error::IccUnsupportedTransferFunction),
-    }
-
-    let hlg_exp = hlg_system_gamma(80.0) - 1.0;
-
-    // 3D CLUT
-    for &r in &eotf_lut {
-        for &g in &eotf_lut {
-            for &b in &eotf_lut {
-                let mut rgb = [r, g, b];
-                let y = luminances[0] * r + luminances[1] * g + luminances[2] * b;
-
-                // Tone map (BT.2408 10000 -> 250 nits for PQ, 80-nit OOTF for HLG)
-                let mult = match transfer_function {
-                    JxlTransferFunction::PQ if y > 1e-10 => {
-                        // PQ(250 nits) = 0.5991247
-                        const MAX_LUM: f32 = 0.599_124_7;
-                        const KS: f32 = 1.5 * MAX_LUM - 0.5;
-                        let mut q = linear_to_pq_simd_vec(jxl_simd::ScalarDescriptor, 1.0, 1e-4, y)
-                            .min(1.0);
-                        if q >= KS {
-                            let t = (q - KS) / (1.0 - KS);
-                            let t2 = t * t;
-                            let t3 = t2 * t;
-                            q = (2.0 * t3 - 3.0 * t2 + 1.0) * KS
-                                + (t3 - 2.0 * t2 + t) * (1.0 - KS)
-                                + (-2.0 * t3 + 3.0 * t2) * MAX_LUM;
-                        }
-                        let mut lin = [q];
-                        pq_to_linear_precise(250.0, &mut lin);
-                        lin[0].clamp(0.0, 1.0) / y
-                    }
-                    JxlTransferFunction::PQ => 0.0,
-                    JxlTransferFunction::HLG => crate::util::fast_powf(y, hlg_exp),
-                    _ => unreachable!(),
-                };
-                for v in &mut rgb {
-                    *v *= mult;
-                }
-
-                // Gamut map (desaturate out-of-gamut > 1.0 channels with preserve_saturation = 0.3)
-                let lum = y * mult;
-                let max_clr = rgb[0].max(rgb[1]).max(rgb[2]);
-                if max_clr > 1.0 {
-                    let gray_mix = (0.7 * (max_clr - 1.0) / (max_clr - lum)).clamp(0.0, 1.0);
-                    for v in &mut rgb {
-                        *v += gray_mix * (lum - *v);
-                    }
-                    let norm = 1.0 / rgb[0].max(rgb[1]).max(rgb[2]).max(1.0);
-                    for v in &mut rgb {
-                        *v *= norm;
-                    }
-                }
-
-                // Convert linear RGB -> XYZ D50 -> 8-bit PCS Lab
-                const WHITE_D50: [f32; 3] = [0.964212, 1.0, 0.825188];
-                const DELTA: f32 = 6.0 / 29.0;
-                let [f_x, f_y, f_z] = std::array::from_fn(|c| {
-                    let v = (rgb[0] * to_xyzd50[c][0]
-                        + rgb[1] * to_xyzd50[c][1]
-                        + rgb[2] * to_xyzd50[c][2])
-                        / WHITE_D50[c];
-                    if v <= DELTA * DELTA * DELTA {
-                        v * (1.0 / (3.0 * DELTA * DELTA)) + 4.0 / 29.0
-                    } else {
-                        v.cbrt()
-                    }
-                });
-                tags.extend_from_slice(&[
-                    (255.0 * (1.16 * f_y - 0.16).clamp(0.0, 1.0)).round() as u8,
-                    (128.0 + (500.0 * (f_x - f_y)).clamp(-128.0, 127.0)).round() as u8,
-                    (128.0 + (200.0 * (f_y - f_z)).clamp(-128.0, 127.0)).round() as u8,
-                ]);
-            }
+    // ICC PCS XYZ encodes 1.0 as 32768 / 65535 (u1.15 fixed point).
+    const XYZ_PCS_SCALE: f64 = 32768.0 / 65535.0;
+    for row in &to_xyzd50 {
+        for &val in row {
+            append_s15_fixed_16(tags, (val * XYZ_PCS_SCALE) as f32)?;
         }
     }
-
-    // Output tables (identity, 256 entries per channel)
     for _ in 0..3 {
-        tags.extend(0..=255u8);
+        append_s15_fixed_16(tags, 0.0)?;
     }
 
+    // offset = 128: M curves (3 type-3 parametric curves with gamma = 2.0, 3 * 32 = 96 bytes)
+    let m_toe_d = match transfer_function {
+        JxlTransferFunction::PQ => PQ_M_CURVE_TOE,
+        JxlTransferFunction::HLG => 0.0,
+        _ => return Err(Error::IccUnsupportedTransferFunction),
+    };
+    let m_a = 1.0 / (1.0 + m_toe_d);
+    let m_b = m_toe_d * m_a;
+    let m_c = 4.0 * m_toe_d * m_a * m_a;
+    let m_params = [2.0, m_a, m_b, m_c, m_toe_d];
+    for _ in 0..3 {
+        create_icc_curv_para_tag(tags, &m_params, 3)?;
+    }
+
+    // offset = 224: A curves (3 256-entry 16-bit 'curv' tables, 3 * 524 = 1572 bytes)
+    let mut a_table: [f32; 256] = std::array::from_fn(|i| i as f32 / 255.0);
+    match transfer_function {
+        JxlTransferFunction::PQ => {
+            pq_to_linear_precise(10000.0, &mut a_table);
+            let y_max = if intensity_target > 255.0 {
+                (intensity_target / 10000.0).min(1.0)
+            } else {
+                1.0
+            };
+            let m = PQ_A_CURVE_M * y_max;
+            for v in &mut a_table {
+                let c = v.clamp(0.0, y_max);
+                let t = (c * (1.0 + m)) / (y_max + m * c);
+                *v = inv_hdr_m_curve(t, m_toe_d);
+            }
+        }
+        JxlTransferFunction::HLG => {
+            hlg_to_scene(&mut a_table);
+            let hlg_gamma = 1.111f32.powf((80.0f32 / 300.0).log2());
+            for v in &mut a_table {
+                let t = v.clamp(0.0, 1.0).powf(hlg_gamma);
+                *v = inv_hdr_m_curve(t, m_toe_d);
+            }
+        }
+        _ => return Err(Error::IccUnsupportedTransferFunction),
+    }
+    let mut a_curve_bytes = Vec::with_capacity(524);
+    a_curve_bytes.extend_from_slice(b"curv");
+    a_curve_bytes.extend_from_slice(&0u32.to_be_bytes());
+    a_curve_bytes.extend_from_slice(&256u32.to_be_bytes());
+    for &v in &a_table {
+        let u16_val = (v * 65535.0).round().clamp(0.0, 65535.0) as u16;
+        a_curve_bytes.extend_from_slice(&u16_val.to_be_bytes());
+    }
+    for _ in 0..3 {
+        tags.extend_from_slice(&a_curve_bytes);
+    }
+
+    // offset = 1796: CLUT (16-byte grid dims + precision=1 + 3 bytes pad + 8-bit 9^3x3 data)
+    for i in 0..16 {
+        tags.push(if i < 3 { HDR_LUT_DIM as u8 } else { 0 });
+    }
+    tags.extend_from_slice(&[1, 0, 0, 0]);
+
+    create_hdr_clut(intensity_target, transfer_function, luminances, tags)?;
+
     Ok(())
+}
+
+simd_function!(
+    create_hdr_clut,
+    d: D,
+    /// Appends the 3D CLUT of the HDR tone-mapping A2B0 tag.
+    fn create_hdr_clut_simd(
+        intensity_target: f32,
+        transfer_function: &JxlTransferFunction,
+        luminances: [f32; 3],
+        tags: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        // Tone map as libjxl (BT.2408 from intensity_target to 250 nits for PQ, HLG OOTF from 300
+        // to 80 nits)
+        match transfer_function {
+            JxlTransferFunction::PQ => {
+                let y_max = if intensity_target > 255.0 {
+                    (intensity_target / 10000.0).min(1.0)
+                } else {
+                    // failsafe: if a PQ image somehow has the default SDR intensity_target, act as if it were 10000
+                    1.0
+                };
+                let m = PQ_A_CURVE_M * y_max;
+                let eotf_lut: [f32; HDR_LUT_DIM] = std::array::from_fn(|i| {
+                    let u = i as f32 / (HDR_LUT_DIM - 1) as f32;
+                    let t = eval_hdr_m_curve(u, PQ_M_CURVE_TOE);
+                    (y_max * t) / (1.0 + m * (1.0 - t))
+                });
+                let zero = D::F32Vec::zero(d);
+                let one = D::F32Vec::splat(d, 1.0);
+                let pq_of_intensity_target =
+                    linear_to_pq_simd_vec(d, one, zero, D::F32Vec::splat(d, y_max));
+                let inv_pq_of_intensity_target = one / pq_of_intensity_target;
+                // PQ(250 nits)
+                let max_lum = D::F32Vec::splat(d, 0.602_559_15) / pq_of_intensity_target;
+                let ks = max_lum.mul_add(D::F32Vec::splat(d, 1.5), D::F32Vec::splat(d, -0.5));
+                // BT.2408's spline is MAX_LUM - SPLINE_K (1 - q)^3, as KS = 1.5 MAX_LUM - 0.5.
+                let spline_k = D::F32Vec::splat(d, 4.0)
+                    / (D::F32Vec::splat(d, 27.0) * (one - max_lum) * (one - max_lum));
+                let scale = D::F32Vec::splat(d, 10000.0 / 250.0);
+                append_hdr_clut(d, &eotf_lut, luminances, PQ_M_CURVE_TOE, tags, {
+                    #[inline(always)]
+                    |y| {
+                        // q only matters above KS, far above PQ(1e-4): no small-input polynomial.
+                        let q =
+                            (linear_to_pq_simd_vec(d, one, zero, y) * inv_pq_of_intensity_target).min(one);
+                        let w = one - q;
+                        let spline = (w * w * w).neg_mul_add(spline_k, max_lum);
+                        // The spline rises from KS to MAX_LUM, so lin is within (0, 1).
+                        let lin = pq_to_linear_simd_vec(d, scale, spline * pq_of_intensity_target);
+                        // The curve is the identity below the knee.
+                        ks.gt(q).if_then_else_f32(scale, lin / y)
+                    }
+                });
+            }
+            JxlTransferFunction::HLG => {
+                let hlg_gamma = 1.111f32.powf((80.0f32 / 300.0).log2());
+                let eotf_lut: [f32; HDR_LUT_DIM] = std::array::from_fn(|i| {
+                    let u = i as f32 / (HDR_LUT_DIM - 1) as f32;
+                    let t = eval_hdr_m_curve(u, 0.0);
+                    t.powf(1.0 / hlg_gamma)
+                });
+                let hlg_exp = D::F32Vec::splat(d, hlg_gamma - 1.0);
+                append_hdr_clut(d, &eotf_lut, luminances, 0.0, tags, {
+                    #[inline(always)]
+                    |y| fast_powf_simd(d, y, hlg_exp)
+                });
+            }
+            _ => return Err(Error::IccUnsupportedTransferFunction),
+        }
+        Ok(())
+    }
+);
+
+/// Appends the 3D CLUT of the HDR `mAB ` tag, encoded with the inverse of the M-curve.
+/// Grid point (r, g, b) has linear RGB from `eotf_lut`, scaled by `tone_map` of its luminance.
+#[inline(always)]
+fn append_hdr_clut<D: SimdDescriptor>(
+    d: D,
+    eotf_lut: &[f32; HDR_LUT_DIM],
+    luminances: [f32; 3],
+    m_toe_d: f32,
+    tags: &mut Vec<u8>,
+    tone_map: impl Fn(D::F32Vec) -> D::F32Vec,
+) {
+    const POINTS: usize = HDR_LUT_DIM * HDR_LUT_DIM * HDR_LUT_DIM;
+    // Steps run over BATCH vectors at a time, so the CPU overlaps their long dependency chains.
+    const BATCH: usize = 4;
+    // Rows a vector of up to 16 lanes can span: 2 at 17 grid points, 3 at 9.
+    const ROWS: usize = 1 + 15usize.div_ceil(HDR_LUT_DIM);
+    const { assert!(D::F32Vec::LEN <= 16) }
+    const { assert!((BATCH * D::F32Vec::LEN).is_multiple_of(D::U8Vec::LEN)) }
+    let len = D::F32Vec::LEN;
+    let zero = D::F32Vec::zero(d);
+    let one = D::F32Vec::splat(d, 1.0);
+    let [lum_r, lum_g, lum_b] = luminances.map(|v| D::F32Vec::splat(d, v));
+    let inv_a = D::F32Vec::splat(d, 1.0 + m_toe_d);
+    let neg_d = D::F32Vec::splat(d, -m_toe_d);
+    let c_slope = 4.0 * m_toe_d / ((1.0 + m_toe_d) * (1.0 + m_toe_d));
+    let yd = D::F32Vec::splat(d, c_slope * m_toe_d);
+    let inv_c = D::F32Vec::splat(d, if c_slope > 0.0 { 1.0 / c_slope } else { 0.0 });
+    let scale_255 = D::F32Vec::splat(d, 255.0);
+    // Repeated per row, so a vector of consecutive b can load from any start b.
+    let grid: [f32; ROWS * HDR_LUT_DIM] = std::array::from_fn(|i| eotf_lut[i % HDR_LUT_DIM]);
+    let row_offset: [f32; ROWS * HDR_LUT_DIM] = std::array::from_fn(|i| (i / HDR_LUT_DIM) as f32);
+    let splat_rg =
+        |rg: usize| [rg / HDR_LUT_DIM, rg % HDR_LUT_DIM].map(|i| D::F32Vec::splat(d, grid[i]));
+
+    // Lanes are consecutive points in the CLUT (b fastest); the last batch is partly padding.
+    let start = tags.len();
+    tags.resize(start + 3 * POINTS.next_multiple_of(BATCH * len), 0);
+    for (batch, out) in tags[start..].chunks_exact_mut(3 * BATCH * len).enumerate() {
+        let rgb: [[D::F32Vec; 3]; BATCH] = std::array::from_fn(|v| {
+            let point = (batch * BATCH + v) * len;
+            let (rg, b) = (point / HDR_LUT_DIM, point % HDR_LUT_DIM);
+            let [[r0, g0], [r1, g1]] = [rg, rg + 1].map(splat_rg);
+            let offset = D::F32Vec::load(d, &row_offset[b..]);
+            let next = offset.gt(zero);
+            // Grids under 15 points only; fold, as an empty `for` changes the code at 17.
+            let [r, g] = (2..ROWS).fold(
+                [next.if_then_else_f32(r1, r0), next.if_then_else_f32(g1, g0)],
+                |[r, g], k| {
+                    let next = offset.gt(D::F32Vec::splat(d, (k - 1) as f32));
+                    let [rk, gk] = splat_rg(rg + k);
+                    [next.if_then_else_f32(rk, r), next.if_then_else_f32(gk, g)]
+                },
+            );
+            [r, g, D::F32Vec::load(d, &grid[b..])]
+        });
+
+        let lum = rgb.map(|[r, g, b]| r.mul_add(lum_r, g.mul_add(lum_g, b * lum_b)));
+        let mult = lum.map(&tone_map);
+
+        // Gamut map (desaturate out-of-gamut > 1.0 channels with preserve_saturation = 0.3)
+        let rgb: [_; BATCH] = std::array::from_fn(|v| {
+            let rgb = rgb[v].map(|c| c * mult[v]);
+            let lum = lum[v] * mult[v];
+            let max_clr = rgb[0].max(rgb[1]).max(rgb[2]);
+            let gray_mix = (D::F32Vec::splat(d, 0.7) * (max_clr - one) / (max_clr - lum))
+                .max(zero)
+                .min(one);
+            let gray_mix = max_clr.gt(one).if_then_else_f32(gray_mix, zero);
+            rgb.map(|c| gray_mix.mul_add(lum - c, c))
+        });
+        // 1 for points within the gamut.
+        let rgb = rgb.map(|rgb| {
+            let norm = one / rgb[0].max(rgb[1]).max(rgb[2]).max(one);
+            rgb.map(|c| c * norm)
+        });
+
+        // Encode with the inverse M-curve (8-bit per channel), then interleave.
+        let mut encoded = [[0u8; BATCH * 16]; 3];
+        for (v, channels) in rgb.into_iter().enumerate() {
+            for (c, buf) in channels.into_iter().zip(&mut encoded) {
+                let c = c.max(zero);
+                let v_pow = c.sqrt().mul_add(inv_a, neg_d);
+                let v_lin = c * inv_c;
+                let u = c.gt(yd).if_then_else_f32(v_pow, v_lin);
+                (u * scale_255)
+                    .max(zero)
+                    .min(scale_255)
+                    .round_store_u8(&mut buf[v * len..]);
+            }
+        }
+        for (i, chunk) in out.chunks_exact_mut(3 * D::U8Vec::LEN).enumerate() {
+            let [r, g, b] = encoded
+                .each_ref()
+                .map(|c| D::U8Vec::load(d, &c[i * D::U8Vec::LEN..]));
+            D::U8Vec::store_interleaved_3(r, g, b, chunk);
+        }
+    }
+    tags.truncate(start + 3 * POINTS);
 }
 
 /// Create mBA B2A0 tag (no-op, required by some software like Safari).
@@ -1986,7 +2172,7 @@ mod test {
 
         assert!(encoding.can_tone_map_for_icc());
 
-        let result = encoding.maybe_create_profile();
+        let result = encoding.maybe_create_profile(10000.0);
         assert!(result.is_ok(), "Profile creation should succeed");
         let profile_opt = result.unwrap();
         assert!(profile_opt.is_some(), "Profile should be generated for PQ");
@@ -1995,17 +2181,17 @@ mod test {
         // Profile should be a valid ICC profile (starts with profile size, then signature)
         assert!(profile.len() > 128, "Profile should have header + tags");
 
-        // Verify header has Lab PCS (bytes 20-23 should be "Lab ")
+        // Verify header has XYZ PCS (bytes 20-23 should be "XYZ ")
         assert_eq!(
             &profile[20..24],
-            b"Lab ",
-            "PCS should be Lab for HDR profiles"
+            b"XYZ ",
+            "PCS should be XYZ for HDR profiles"
         );
 
-        // Check for 'mft1' (A2B0 tag type) somewhere in the profile
+        // Check for 'mAB ' (A2B0 tag type) somewhere in the profile
         assert!(
-            profile.windows(4).any(|w| w == b"mft1"),
-            "Profile should contain mft1 tag (A2B0)"
+            profile.windows(4).any(|w| w == b"mAB "),
+            "Profile should contain mAB tag (A2B0)"
         );
         assert!(
             profile.windows(4).any(|w| w == b"mBA "),
@@ -2019,6 +2205,37 @@ mod test {
         );
     }
 
+    /// The HDR CLUT on every instruction set: within 1 of scalar, and exact at a few points.
+    fn test_hdr_icc_lut<D: SimdDescriptor>(d: D) {
+        let [(rx, ry), (gx, gy), (bx, by)] = JxlPrimaries::BT2100.to_xy_coords();
+        let (wx, wy) = JxlWhitePoint::D65.to_xy_coords();
+        let to_xyz = primaries_to_xyz(rx, ry, gx, gy, bx, by, wx, wy).unwrap();
+        let luminances = to_xyz[1].map(|v| v as f32);
+        let scalar_d = jxl_simd::ScalarDescriptor::new().unwrap();
+        let [pq, hlg] = [JxlTransferFunction::PQ, JxlTransferFunction::HLG].map(|tf| {
+            let (mut clut, mut scalar) = (Vec::new(), Vec::new());
+            create_hdr_clut_simd(d, 10000.0, &tf, luminances, &mut clut).unwrap();
+            create_hdr_clut_simd(scalar_d, 10000.0, &tf, luminances, &mut scalar).unwrap();
+            assert_eq!(clut.len(), 3 * HDR_LUT_DIM * HDR_LUT_DIM * HDR_LUT_DIM);
+            assert!(clut.iter().zip(&scalar).all(|(a, b)| a.abs_diff(*b) <= 1));
+            clut
+        });
+        // Basic check for a few reference points.
+        let white = HDR_LUT_DIM - 1;
+        let gray = white / 8;
+        for ([r, g, b], pq_rgb, hlg_rgb) in [
+            ([0, 0, 0], [0, 0, 0], [0, 0, 0]),
+            ([gray, gray, gray], [130, 130, 130], [32, 32, 32]),
+            ([white, white, white], [255, 255, 255], [255, 255, 255]),
+        ] {
+            let i = 3 * ((r * HDR_LUT_DIM + g) * HDR_LUT_DIM + b);
+            assert_eq!(pq[i..i + 3], pq_rgb);
+            assert_eq!(hlg[i..i + 3], hlg_rgb);
+        }
+    }
+
+    jxl_simd::test_all_instruction_sets!(test_hdr_icc_lut);
+
     #[test]
     fn test_hdr_icc_profile_generation_hlg() {
         // Test that HLG HDR color encoding generates an ICC profile with A2B0/B2A0 tags
@@ -2031,7 +2248,7 @@ mod test {
 
         assert!(encoding.can_tone_map_for_icc());
 
-        let result = encoding.maybe_create_profile();
+        let result = encoding.maybe_create_profile(10000.0);
         assert!(result.is_ok(), "Profile creation should succeed");
         let profile_opt = result.unwrap();
         assert!(profile_opt.is_some(), "Profile should be generated for HLG");
@@ -2102,15 +2319,15 @@ mod test {
         let color_profile = decoder.output_color_profile().unwrap();
 
         // For HDR PQ content, we should be able to generate an ICC profile
-        let icc = color_profile.try_as_icc();
+        let icc = color_profile.try_as_icc(10000.0);
         assert!(
             icc.is_some(),
             "Should generate ICC profile for HDR PQ content"
         );
 
         let profile = icc.unwrap();
-        // Verify it's an HDR profile with Lab PCS
-        assert_eq!(&profile[20..24], b"Lab ", "PCS should be Lab for HDR");
+        // Verify it's an HDR profile with XYZ PCS
+        assert_eq!(&profile[20..24], b"XYZ ", "PCS should be XYZ for HDR");
         // Verify A2B0 tag exists
         assert!(
             profile.windows(4).any(|w| w == b"A2B0"),
@@ -2144,15 +2361,15 @@ mod test {
         let color_profile = decoder.output_color_profile().unwrap();
 
         // For HDR HLG content, we should be able to generate an ICC profile
-        let icc = color_profile.try_as_icc();
+        let icc = color_profile.try_as_icc(1000.0);
         assert!(
             icc.is_some(),
             "Should generate ICC profile for HDR HLG content"
         );
 
         let profile = icc.unwrap();
-        // Verify it's an HDR profile with Lab PCS
-        assert_eq!(&profile[20..24], b"Lab ", "PCS should be Lab for HDR");
+        // Verify it's an HDR profile with XYZ PCS
+        assert_eq!(&profile[20..24], b"XYZ ", "PCS should be XYZ for HDR");
         // Verify A2B0 tag exists
         assert!(
             profile.windows(4).any(|w| w == b"A2B0"),
@@ -2301,7 +2518,9 @@ mod test {
             rendering_intent: RenderingIntent::Perceptual,
         });
 
-        let icc = xyb.try_as_icc().expect("XYB should generate ICC profile");
+        let icc = xyb
+            .try_as_icc(255.0)
+            .expect("XYB should generate ICC profile");
         assert!(!icc.is_empty());
         assert!(icc.windows(4).any(|w| w == b"mAB "));
         assert!(icc.windows(4).any(|w| w == b"mBA "));

@@ -6,6 +6,7 @@
 #![allow(unsafe_code)]
 
 mod data_type;
+mod downsample;
 mod internal;
 mod output_buffer;
 mod raw;
@@ -16,7 +17,8 @@ mod test;
 mod typed;
 
 pub use data_type::{DataTypeTag, ImageDataType};
-pub use output_buffer::JxlOutputBuffer;
+pub(crate) use downsample::{align_origin, box_average};
+pub use output_buffer::{JxlOutputBuffer, JxlOutputTransform};
 pub use raw::{OwnedRawImage, RawImageRect, RawImageRectMut};
 pub use rect::Rect;
 pub(crate) use recycler::BufferRecycler;

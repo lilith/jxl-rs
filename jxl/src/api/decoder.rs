@@ -6,11 +6,13 @@
 use super::box_parser::{BoxParser, CodestreamInput};
 use super::codestream_parser::{CodestreamParser, FrameStartInfo};
 use super::{
-    Event, JxlAuxBox, JxlAuxBoxType, JxlBasicInfo, JxlBitstreamInput, JxlColorProfile,
-    JxlDecoderOptions, JxlFrameHeader, JxlOutputBuffer, JxlParallelRunner, JxlParallelRunnerFun,
-    JxlPixelFormat,
+    Event, JxlAuxBox, JxlAuxBoxType, JxlBasicInfo, JxlBitstreamInput, JxlBytesNeeded,
+    JxlColorProfile, JxlDecoderOptions, JxlFrameHeader, JxlOutputBuffer, JxlParallelRunner,
+    JxlParallelRunnerFun, JxlPixelFormat, JxlProgressiveStatus,
 };
+use crate::api::Orientation;
 use crate::error::{Error, Result};
+use crate::image::Rect;
 
 struct SequentialRunner;
 
@@ -79,6 +81,8 @@ impl JxlDecoder {
 
     /// Resets the decoder to its initial state so it can be reused to decode a new file with the
     /// same [`JxlDecoderOptions`].
+    ///
+    /// Downsample factor and crop region are also cleared.
     ///
     /// Internal buffers and scratch allocations are retained across resets to avoid repeated
     /// allocations when decoding multiple images.
@@ -156,13 +160,15 @@ impl JxlDecoder {
                 "cannot set pixel format before BasicInfo",
             ));
         }
-        let frame_header_was_decoded = self
-            .codestream_parser
-            .frame_info
-            .current_frame_header()
-            .is_some()
-            || !self.codestream_parser.scanned_frames().is_empty();
-        if frame_header_was_decoded
+        if !pixel_format
+            .color_data_format
+            .iter()
+            .chain(pixel_format.extra_channel_format.iter().flatten())
+            .all(|f| f.is_valid())
+        {
+            return Err(Error::ApiUsageError("invalid bit_depth for data format"));
+        }
+        if self.codestream_parser.frame_header_was_decoded()
             && self.codestream_parser.pixel_format.as_ref() != Some(&pixel_format)
         {
             return Err(Error::ApiUsageError(
@@ -171,6 +177,92 @@ impl JxlDecoder {
         }
         self.codestream_parser.pixel_format = Some(pixel_format);
         self.codestream_parser.update_default_output_options();
+        Ok(())
+    }
+
+    /// Sets the downsample factor for decoding.
+    ///
+    /// The downsampling factor is an integer between 0 and 3 (both inclusive). If set above 0, the
+    /// decoder will render the final image downsampled by `2^factor` times.
+    ///
+    /// This method may fail if crop region becomes unaligned when downsample factor is changed
+    /// (see [`Self::set_crop_region`].)
+    ///
+    /// # Errors
+    ///
+    /// - Returns API usage error when called after the first frame header is decoded.
+    /// - Returns an error if the downsampling factor is out of supported range.
+    pub fn set_downsample_factor(&mut self, factor: u8) -> Result<()> {
+        if self.codestream_parser.frame_header_was_decoded() {
+            return Err(Error::ApiUsageError(
+                "cannot change downsample factor after first frame header",
+            ));
+        }
+        if factor > 3 {
+            return Err(Error::InvalidOutputDownsamplingShift(factor));
+        }
+        let crop = self.codestream_parser.crop_region;
+        let mask = (1 << factor) - 1;
+        if (crop.origin.0 | crop.origin.1) & mask != 0 {
+            return Err(Error::InvalidCropRegion);
+        }
+
+        self.codestream_parser.downsample_factor = factor;
+        self.codestream_parser.update_size(&self.options);
+        Ok(())
+    }
+
+    /// Restricts visible-frame output to a region.
+    ///
+    /// The region is expected to be in image coordinates before applying downsample factor. When
+    /// downsample factor is also set, this method returns an error if `origin` is
+    /// not aligned to downsampled image grid *before applying image orientation.*
+    ///
+    /// This method will fail if frame decoding has already started. In that case, reset the
+    /// decoder before updating the crop region using [`JxlDecoder::reset`].
+    pub fn set_crop_region(&mut self, region: Option<Rect>) -> Result<()> {
+        if !self.codestream_parser.image_info.is_complete() {
+            return Err(Error::ApiUsageError(
+                "crop region must be set after BasicInfo",
+            ));
+        }
+        if self.codestream_parser.frame_header_was_decoded() {
+            return Err(Error::ApiUsageError(
+                "cannot change crop region after first frame header",
+            ));
+        }
+
+        let file_header = self.codestream_parser.image_info.file_header();
+        let adjust_orientation = self.options.adjust_orientation;
+        let size = file_header.display_image_size(adjust_orientation);
+
+        let mut region = region.unwrap_or(Rect {
+            origin: (0, 0),
+            size,
+        });
+        let rect_end = region.end();
+        if rect_end.0 > size.0 || rect_end.1 > size.1 {
+            return Err(crate::error::Error::InvalidCropRegion);
+        }
+
+        // Unorient the crop region.
+        if adjust_orientation {
+            let orientation = file_header.image_metadata.orientation;
+            let inverse = match orientation {
+                Orientation::Rotate90Cw => Orientation::Rotate90Ccw,
+                Orientation::Rotate90Ccw => Orientation::Rotate90Cw,
+                _ => orientation,
+            };
+            region = inverse.display_rect(region, size);
+        }
+
+        let mask = (1 << self.codestream_parser.downsample_factor) - 1;
+        if (region.origin.0 | region.origin.1) & mask != 0 {
+            return Err(Error::InvalidCropRegion);
+        }
+
+        self.codestream_parser.crop_region = region;
+        self.codestream_parser.update_size(&self.options);
         Ok(())
     }
 
@@ -185,7 +277,13 @@ impl JxlDecoder {
         // The render pipeline always adds ExtendToImageDimensionsStage which extends
         // frames to the full image size. So the output size is always the image size,
         // not the frame's upsampled size.
-        let size = self.codestream_parser.image_info.basic_info().size;
+        // Also, downsample factor and crop region are already applied to the size.
+        let basic_info = self.codestream_parser.image_info.basic_info();
+        let size = if self.codestream_parser.in_preview_frame() {
+            basic_info.preview_size.unwrap()
+        } else {
+            basic_info.size
+        };
         Some(JxlFrameHeader {
             name: frame_header.name.clone(),
             duration: self
@@ -267,10 +365,6 @@ impl JxlDecoder {
     /// This function will return when reaching the next decoding stage (i.e. finished decoding
     /// file/frame header, finished decoding a frame, or finished the entire decode).
     ///
-    /// Output `buffers` may be provided any time after [`Event::BasicInfo`]; they will only be
-    /// written to when decoding a visible frame's sections (between [`Event::FrameHeader`] and
-    /// [`Event::FrameComplete`]).
-    ///
     /// If called when decoding a frame with `None` for `buffers`, the frame will still be read,
     /// but pixel data will not be produced. Note that reference frames that may be needed by
     /// later frames are still decoded internally even if `buffers` is `None`.
@@ -279,9 +373,8 @@ impl JxlDecoder {
     /// and use [`Self::start_new_frame()`] to seek directly to the desired frame's keyframe.
     ///
     /// Note: the data in `buffers` should have alignment that is compatible with the requested
-    /// pixel format. This means that, if we are asking for 2-byte or 4-byte output (i.e. u16/f16
-    /// and f32 respectively), each row in the provided buffers must be aligned to 2 or 4 bytes
-    /// respectively. If that is not the case, the library may panic.
+    /// pixel format (2-byte or 4-byte row alignment for u16/f16 and f32 respectively) for
+    /// optimal performance.
     #[inline(never)]
     pub fn process(
         &mut self,
@@ -325,5 +418,19 @@ impl JxlDecoder {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Returns the progressive decoding status reached by the current frame so far,
+    /// or `None` if no progressive level has been reached yet (or no frame is active).
+    pub fn frame_progressive_status(&self) -> Option<JxlProgressiveStatus> {
+        self.codestream_parser
+            .frame_progressive_status(&self.options)
+    }
+
+    /// Returns the number of additional input bytes needed to reach `target` progressive
+    /// decoding status for the current frame.
+    pub fn bytes_needed_for_status(&self, target: JxlProgressiveStatus) -> JxlBytesNeeded {
+        self.codestream_parser
+            .bytes_needed_for_status(target, &self.box_parser, &self.options)
     }
 }

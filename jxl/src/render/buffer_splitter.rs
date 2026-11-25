@@ -4,11 +4,11 @@
 // license that can be found in the LICENSE file.
 
 use std::collections::BTreeSet;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
 use crate::api::JxlOutputBuffer;
 use crate::headers::Orientation;
-use crate::image::{Image, ImageDataType, Rect};
+use crate::image::{Image, ImageDataType, Rect, align_origin};
 use crate::util::sync::Mutex;
 use crate::util::{ChannelVec, ShiftRightCeil};
 
@@ -55,6 +55,7 @@ impl<'a> OutputChannelSplitter<'a> {
 
     #[allow(unsafe_code)]
     pub fn borrow_rect(&self, rect: Rect) -> OutputChannelRef<'a, '_> {
+        assert!(rect.size.0 != 0 && rect.size.1 != 0);
         let mut rects = self
             .borrowed_rects
             .lock()
@@ -62,37 +63,64 @@ impl<'a> OutputChannelSplitter<'a> {
         for r in rects.iter() {
             assert!(!r.intersects(&rect));
         }
-        rects.insert(rect);
+        // SAFETY: `rect` is non-empty and we just checked that `self.borrowed_rects`
+        // does not contain any rects that intersect with the new rect. Since by safety
+        // invariant all the currently-borrowed rects are in `self.borrowed_rects`, the
+        // new rect does not intersect the old ones.
+        let buf = unsafe { self.buffer.rect(rect) };
+        assert!(rects.insert(rect));
 
         OutputChannelRef {
             s: self,
             r: rect,
-            // SAFETY: we just checked that `self.borrowed_rects` does not contain
-            // any rects that intersect with the new rect. Since by safety invariant
-            // all the currently-borrowed rects are in `self.borrowed_rects`, the
-            // new rect does not intersect the old ones.
-            buf: Some(unsafe { self.buffer.rect(rect) }),
+            buf: Some(buf),
         }
     }
 }
 
 pub struct OutputChannelRef<'a, 'b> {
-    s: &'a OutputChannelSplitter<'b>,
+    s: &'b OutputChannelSplitter<'a>,
     buf: Option<JxlOutputBuffer<'b>>,
     // Safety invariant: `r` is the rect that was used to obtain `buf` from `s`.
     r: Rect,
+}
+
+impl<'a, 'b> OutputChannelRef<'a, 'b> {
+    pub(crate) fn row_mut(&mut self, row: usize) -> &mut [u8] {
+        self.buf.as_mut().unwrap().row_mut(row)
+    }
+
+    pub(crate) fn typed_row_mut<T: ImageDataType>(&mut self, row: usize) -> &mut [T] {
+        self.buf.as_mut().unwrap().typed_row_mut(row)
+    }
+
+    #[inline(always)]
+    pub fn write_transformed(
+        &mut self,
+        row: usize,
+        col_pixel: usize,
+        bytes_per_pixel: usize,
+        src: &[&[f32]],
+    ) {
+        let num_pixels = src[0].len();
+        debug_assert!(num_pixels > 0);
+        debug_assert!(src.iter().all(|s| s.len() == num_pixels));
+        let buf = self.buf.as_mut().unwrap();
+        let transform = buf
+            .transform()
+            .expect("JxlDataFormat::Custom requires JxlOutputBuffer::with_transform");
+        let x = self.r.origin.0 / bytes_per_pixel + col_pixel;
+        let y = self.r.origin.1 + row;
+        let dst = &mut buf.row_mut(row)
+            [col_pixel * bytes_per_pixel..(col_pixel + num_pixels) * bytes_per_pixel];
+        transform(x, y, src, dst);
+    }
 }
 
 impl<'a, 'b> Deref for OutputChannelRef<'a, 'b> {
     type Target = JxlOutputBuffer<'b>;
     fn deref(&self) -> &Self::Target {
         self.buf.as_ref().unwrap()
-    }
-}
-
-impl<'a, 'b> DerefMut for OutputChannelRef<'a, 'b> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buf.as_mut().unwrap()
     }
 }
 
@@ -118,6 +146,7 @@ pub struct SaveStageBufferInfo {
     pub orientation: Orientation,
     pub byte_size: usize,
     pub after_extend: bool,
+    pub output_viewport: Option<Rect>,
 }
 
 /// Data structure responsible for handing out access to portions of the output buffers.
@@ -172,7 +201,19 @@ impl<'a> BufferSplitter<'a> {
                     // Before-extend stages do not write to rects outside the current frame.
                     return None;
                 }
-                let mut channel_rect = rect.downsample(bi.downsample);
+                let (dx, dy) = bi.downsample;
+                let channel_size = if bi.after_extend {
+                    full_image_size
+                } else {
+                    frame_size
+                };
+                let channel_size = (channel_size.0.shrc(dx), channel_size.1.shrc(dy));
+                let origin = (rect.origin.0 >> dx, rect.origin.1 >> dy);
+                let end = (rect.end().0.shrc(dx), rect.end().1.shrc(dy));
+                let mut channel_rect = Rect {
+                    origin,
+                    size: (end.0 - origin.0, end.1 - origin.1),
+                };
                 if !outside_current_frame {
                     let frame_size = (
                         frame_size.0.shrc(bi.downsample.0),
@@ -182,17 +223,19 @@ impl<'a> BufferSplitter<'a> {
                     if bi.after_extend {
                         // clip this rect to its visible area in the full image (in full image coordinates).
                         let origin = (
-                            rect.origin.0 as isize + frame_origin.0,
-                            rect.origin.1 as isize + frame_origin.1,
+                            channel_rect.origin.0 as isize
+                                + align_origin(frame_origin.0, dx as usize),
+                            channel_rect.origin.1 as isize
+                                + align_origin(frame_origin.1, dy as usize),
                         );
                         let end = (
-                            origin.0 + rect.size.0 as isize,
-                            origin.1 + rect.size.1 as isize,
+                            origin.0 + channel_rect.size.0 as isize,
+                            origin.1 + channel_rect.size.1 as isize,
                         );
                         let origin = (origin.0.max(0) as usize, origin.1.max(0) as usize);
                         let end = (
-                            end.0.min(full_image_size.0 as isize).max(0) as usize,
-                            end.1.min(full_image_size.1 as isize).max(0) as usize,
+                            end.0.min(channel_size.0 as isize).max(0) as usize,
+                            end.1.min(channel_size.1 as isize).max(0) as usize,
                         );
                         channel_rect = Rect {
                             origin,
@@ -203,11 +246,17 @@ impl<'a> BufferSplitter<'a> {
                         };
                     }
                 }
+                let canvas = bi.output_viewport.unwrap_or(Rect {
+                    origin: (0, 0),
+                    size: channel_size,
+                });
+                channel_rect = channel_rect.intersection(canvas);
                 if channel_rect.size.0 == 0 || channel_rect.size.1 == 0 {
-                    // Buffer would be empty anyway.
                     return None;
                 }
-                let channel_rect = bi.orientation.display_rect(channel_rect, full_image_size);
+                channel_rect.origin.0 -= canvas.origin.0;
+                channel_rect.origin.1 -= canvas.origin.1;
+                let channel_rect = bi.orientation.display_rect(channel_rect, canvas.size);
                 let channel_rect = channel_rect.to_byte_rect_sz(bi.byte_size);
                 Some(buf.borrow_rect(channel_rect))
             })
@@ -282,6 +331,7 @@ mod tests {
             orientation: Orientation::Identity,
             byte_size: 1,
             after_extend: false,
+            output_viewport: None,
         })];
 
         let _local1 = splitter.get_local_buffers(
@@ -331,6 +381,7 @@ mod tests {
                             orientation,
                             byte_size,
                             after_extend: false,
+                            output_viewport: None,
                         })
                     } else {
                         None
@@ -415,6 +466,17 @@ mod tests {
             }
 
             Ok(())
+        });
+    }
+
+    #[test]
+    #[should_panic]
+    fn oob_borrow_rect_does_not_double_panic_on_drop() {
+        let mut raw = vec![0u8; 16 * 16];
+        let splitter = OutputChannelSplitter::new(JxlOutputBuffer::new(&mut raw, 16, 16));
+        let _ = splitter.borrow_rect(Rect {
+            origin: (0, 0),
+            size: (32, 16),
         });
     }
 }
