@@ -10,9 +10,10 @@ use crate::frame::ReferenceFrame;
 use crate::headers::FileHeader;
 use crate::headers::extra_channels::ExtraChannelInfo;
 use crate::headers::frame_header::*;
+use crate::image::align_origin;
 use crate::render::{ErasedLocalState, RenderPipelineInPlaceStage};
-use crate::util::ChannelVec;
 use crate::util::sync::Arc;
+use crate::util::{ChannelVec, ShiftRightCeil};
 
 pub struct BlendingStage {
     pub frame_origin: (isize, isize),
@@ -60,11 +61,10 @@ impl BlendingStage {
         frame_header: &FrameHeader,
         file_header: &FileHeader,
         reference_frames: Arc<[Option<ReferenceFrame>; 4]>,
+        shift: usize,
     ) -> Result<BlendingStage> {
-        let image_size = (
-            file_header.size.xsize() as usize,
-            file_header.size.ysize() as usize,
-        );
+        let image_size = file_header.codestream_image_size();
+        let image_size = (image_size.0.shrc(shift), image_size.1.shrc(shift));
         for info in
             std::iter::once(&frame_header.blending_info).chain(frame_header.ec_blending_info.iter())
         {
@@ -81,7 +81,10 @@ impl BlendingStage {
         let ec_blending_info = frame_header.ec_blending_info.clone();
         let ec_patch_blending_info = ec_blending_info.iter().map(PatchBlending::from).collect();
         Ok(BlendingStage {
-            frame_origin: (frame_header.x0 as isize, frame_header.y0 as isize),
+            frame_origin: (
+                align_origin(frame_header.x0 as isize, shift),
+                align_origin(frame_header.y0 as isize, shift),
+            ),
             image_size: (image_size.0 as isize, image_size.1 as isize),
             blending_info: frame_header.blending_info.clone(),
             ec_blending_info,
@@ -196,10 +199,7 @@ mod test {
     fn blending_consistency() -> Result<()> {
         let (file_header, frame_header, _) =
             read_headers_and_toc(include_bytes!("../../../resources/test/basic.jxl")).unwrap();
-        let image_size = (
-            file_header.size.xsize() as usize,
-            file_header.size.ysize() as usize,
-        );
+        let image_size = file_header.codestream_image_size();
         let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
         let mut reference_frame =
             || ReferenceFrame::random(&mut rng, image_size.0, image_size.1, 4, false);
@@ -210,7 +210,10 @@ mod test {
             Some(reference_frame()?),
         ]);
         crate::render::test::test_stage_consistency(
-            || BlendingStage::new(&frame_header, &file_header, reference_frames.clone()).unwrap(),
+            || {
+                BlendingStage::new(&frame_header, &file_header, reference_frames.clone(), 0)
+                    .unwrap()
+            },
             (500, 500),
             4,
         )
@@ -221,10 +224,7 @@ mod test {
         let (file_header, mut frame_header, _) =
             read_headers_and_toc(include_bytes!("../../../resources/test/basic.jxl")).unwrap();
         frame_header.blending_info.source = 3;
-        let image_size = (
-            file_header.size.xsize() as usize,
-            file_header.size.ysize() as usize,
-        );
+        let image_size = file_header.codestream_image_size();
         let reference_frames = Arc::new([
             None,
             None,
@@ -232,7 +232,7 @@ mod test {
             Some(ReferenceFrame::blank(image_size.0, image_size.1, 4, true)?),
         ]);
 
-        let result = BlendingStage::new(&frame_header, &file_header, reference_frames);
+        let result = BlendingStage::new(&frame_header, &file_header, reference_frames, 0);
         assert!(matches!(result, Err(Error::BlendingPreColorTransform(3))));
         Ok(())
     }
@@ -244,10 +244,7 @@ mod test {
         let mut ec_blending_info = frame_header.blending_info.clone();
         ec_blending_info.source = 2;
         frame_header.ec_blending_info.push(ec_blending_info);
-        let image_size = (
-            file_header.size.xsize() as usize,
-            file_header.size.ysize() as usize,
-        );
+        let image_size = file_header.codestream_image_size();
         let reference_frames = Arc::new([
             None,
             None,
@@ -255,7 +252,7 @@ mod test {
             None,
         ]);
 
-        let result = BlendingStage::new(&frame_header, &file_header, reference_frames);
+        let result = BlendingStage::new(&frame_header, &file_header, reference_frames, 0);
         assert!(matches!(result, Err(Error::BlendingPreColorTransform(2))));
         Ok(())
     }

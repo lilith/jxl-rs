@@ -8,9 +8,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IoSliceMut, Read};
 
-use crate::api::{JxlBitstreamInput, JxlSignature, ProfileLevel, SmallBuffer, check_signature};
+use crate::api::signature::CONTAINER_SIGNATURE;
+use crate::api::{
+    Event, JxlBitstreamInput, JxlBytesNeeded, JxlDecoder, JxlDecoderOptions, JxlSignature,
+    ProfileLevel, SmallBuffer, check_signature,
+};
 use crate::error::{Error, Result};
-#[cfg(feature = "brotli")]
 use crate::util::NewWithCapacity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,8 +277,22 @@ impl BoxParser {
         }
     }
 
-    pub(super) fn total_bytes_consumed(&self, _codestream_bytes_consumed: u64) -> u64 {
-        self.local_buffer.consumed()
+    pub(super) fn total_bytes_consumed(&self, codestream_bytes_consumed: u64) -> u64 {
+        // Buffered out-of-order boxes leave an invalid checkpoint behind, so
+        // the codestream's logical end can sit at an earlier file offset than
+        // payload already consumed. In that case report the physical input
+        // consumed; otherwise map the logical position back to a file offset,
+        // which ignores lookahead bytes the refill may have overread.
+        if self
+            .codestream_pos_to_box
+            .values()
+            .any(|c| !c.is_valid_checkpoint)
+        {
+            self.local_buffer.consumed()
+        } else {
+            let (start, b) = self.codestream_pos_to_box.last_key_value().unwrap();
+            b.file_position + codestream_bytes_consumed.saturating_sub(*start)
+        }
     }
 
     pub(super) fn aux_boxes(&self, box_type: JxlAuxBoxType) -> &[JxlAuxBox] {
@@ -310,12 +327,44 @@ impl BoxParser {
         }
     }
 
+    pub(super) fn input_bytes_needed(
+        &self,
+        codestream_bytes: usize,
+        is_lower_bound: bool,
+    ) -> JxlBytesNeeded {
+        if codestream_bytes == 0 && !is_lower_bound {
+            return JxlBytesNeeded::Exact(0);
+        }
+        if !self.ooo_jxlp_buffer.is_empty() {
+            return JxlBytesNeeded::Unknown;
+        }
+        let needed = codestream_bytes
+            .max(usize::from(is_lower_bound))
+            .saturating_sub(self.local_buffer.len());
+        if self.latest_codestream_box == CodestreamBoxType::Jxlc
+            && matches!(self.state, ParseState::Codestream(_))
+        {
+            if is_lower_bound {
+                JxlBytesNeeded::LowerBound(needed.max(1))
+            } else {
+                JxlBytesNeeded::Exact(needed)
+            }
+        } else if needed > 0 {
+            JxlBytesNeeded::LowerBound(needed)
+        } else {
+            JxlBytesNeeded::Unknown
+        }
+    }
+
     /// Adds a checkpoint for the codestream box that is about to become the
     /// current one (i.e. the box that the codestream data will next be read
     /// from, in logical jxlp order).
     ///
     /// `file_position` is the file offset of the box's contents and
     /// `codestream_left` is the amount of codestream bytes the box contains.
+    /// `is_valid_checkpoint` records whether a frame header may start in the
+    /// box, and `can_restart` whether a file-position restart at the
+    /// checkpoint can supply all the codestream bytes that may be needed.
     fn add_checkpoint(
         &mut self,
         file_position: u64,
@@ -528,15 +577,7 @@ impl BoxParser {
                     }
                     self.state = ParseState::Skip(count.map(|x| x - n));
                 }
-                ParseState::Aux(None) => {
-                    let local_buffer_len = self.local_buffer.len();
-                    let buf = self.aux.box_buffer.as_mut().unwrap();
-                    if local_buffer_len > 0 {
-                        buf.data.extend_from_slice(&self.local_buffer);
-                        self.local_buffer.consume(local_buffer_len);
-                    }
-                    return Ok(());
-                }
+                ParseState::Aux(None) => unreachable!(),
                 ParseState::Aux(Some(count)) => {
                     if count == 0 {
                         let buf = self.aux.box_buffer.take().unwrap();
@@ -740,6 +781,13 @@ impl BoxParser {
         } else {
             return Err(Error::InvalidBox);
         };
+
+        if content_len.is_none()
+            && !matches!(&ty, b"jxlc" | b"jxlp")
+            && !self.latest_codestream_box.is_last()
+        {
+            return Err(Error::InvalidBox);
+        }
 
         match &ty {
             b"ftyp" => {
@@ -947,6 +995,117 @@ impl<'a> CodestreamInput<'a> {
         self.box_parser.mark_codestream_read(n);
         Ok(n)
     }
+}
+
+const FTYP_BOX: [u8; 20] = [
+    0, 0, 0, 20, b'f', b't', b'y', b'p', b'j', b'x', b'l', b' ', 0, 0, 0, 0, b'j', b'x', b'l', b' ',
+];
+
+const JXLL_LEVEL10_BOX: [u8; 9] = [0, 0, 0, 9, b'j', b'x', b'l', b'l', 10];
+
+const SMALL_BOX_HEADER_SIZE: u64 = 8;
+const LARGE_BOX_HEADER_SIZE: u64 = 16;
+const LARGE_BOX_CONTENT_SIZE_THRESHOLD: u64 = 0x1_0000_0000 - SMALL_BOX_HEADER_SIZE;
+
+fn append_box_header(box_type: &[u8; 4], content_size: usize, output: &mut Vec<u8>) {
+    let size = content_size as u64;
+    if size >= LARGE_BOX_CONTENT_SIZE_THRESHOLD {
+        let box_size = size + LARGE_BOX_HEADER_SIZE;
+        output.extend_from_slice(&1u32.to_be_bytes());
+        output.extend_from_slice(box_type);
+        output.extend_from_slice(&box_size.to_be_bytes());
+    } else {
+        let box_size = (size + SMALL_BOX_HEADER_SIZE) as u32;
+        output.extend_from_slice(&box_size.to_be_bytes());
+        output.extend_from_slice(box_type);
+    }
+}
+
+fn needs_level10(codestream: &[u8], scan_frames_only: bool) -> bool {
+    let options = JxlDecoderOptions {
+        skip_preview: false,
+        scan_frames_only,
+        ..Default::default()
+    };
+
+    let mut decoder = JxlDecoder::new(options);
+    let mut input = codestream;
+
+    loop {
+        match decoder.process(&mut input, None, None) {
+            Ok(Event::BasicInfo | Event::FrameHeader | Event::FrameComplete { .. }) => {}
+            Ok(Event::Complete | Event::NeedMoreInput { .. }) => return false,
+            Err(Error::LevelLimitExceeded {
+                level: ProfileLevel::Main5,
+                ..
+            }) => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn pack_codestream(input_bytes: &[u8], level10_mode: u8) -> Result<Vec<u8>> {
+    if check_signature(input_bytes) != JxlSignature::Codestream {
+        return Err(Error::InvalidSignature);
+    }
+
+    let use_level10 = match level10_mode {
+        0 => false,
+        1 => true,
+        2 => needs_level10(input_bytes, true),
+        _ => needs_level10(input_bytes, false),
+    };
+    let jxll_len = if use_level10 {
+        JXLL_LEVEL10_BOX.len()
+    } else {
+        0
+    };
+
+    // 12 bytes for "JXL ", 20 bytes for "ftyp", optional 9 bytes for "jxll",
+    // and up to 16 bytes for the "jxlc" header.
+    let mut container = Vec::new_with_capacity(
+        CONTAINER_SIGNATURE.len()
+            + FTYP_BOX.len()
+            + jxll_len
+            + LARGE_BOX_HEADER_SIZE as usize
+            + input_bytes.len(),
+    )?;
+    container.extend_from_slice(&CONTAINER_SIGNATURE);
+    container.extend_from_slice(&FTYP_BOX);
+    if use_level10 {
+        container.extend_from_slice(&JXLL_LEVEL10_BOX);
+    }
+    append_box_header(b"jxlc", input_bytes.len(), &mut container);
+    container.extend_from_slice(input_bytes);
+
+    Ok(container)
+}
+
+#[doc(hidden)]
+pub fn extract_codestream(mut input_bytes: &[u8]) -> Result<(Vec<u8>, Option<ProfileLevel>)> {
+    if check_signature(input_bytes) != JxlSignature::Container {
+        return Err(Error::InvalidBox);
+    }
+
+    let mut parser = BoxParser::with_aux_boxes(None);
+    parser.close_input();
+
+    let mut codestream = Vec::new();
+    {
+        let mut stream = CodestreamInput::new(&mut parser, &mut input_bytes);
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = stream.read(&mut [IoSliceMut::new(&mut buf)])?;
+            if n == 0 {
+                break;
+            }
+            codestream.try_reserve(n)?;
+            codestream.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    Ok((codestream, parser.container_level()))
 }
 
 #[cfg(test)]

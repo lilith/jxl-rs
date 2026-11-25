@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use super::internal::{RenderPipelineShared, Stage};
-use super::stages::ExtendToImageDimensionsStage;
+use super::stages::{DownsampleStage, ExtendToImageDimensionsStage};
 use super::{RenderPipeline, RenderPipelineInOutStage, RenderPipelineInPlaceStage};
 use crate::api::{JxlColorType, JxlDataFormat};
 use crate::error::{Error, Result};
 use crate::headers::Orientation;
 use crate::headers::bit_depth::BitDepth;
-use crate::image::{BufferRecycler, DataTypeTag};
+use crate::image::{BufferRecycler, DataTypeTag, Rect};
 use crate::render::internal::ChannelInfo;
 use crate::render::save::{SaveChannelType, SaveStage};
 use crate::render::stages::{ConvertModular16ToF32Stage, ConvertModularToF32Stage};
@@ -44,6 +44,7 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
         log_group_size += downsampling_shift;
         Self {
             shared: RenderPipelineShared {
+                channel_output_downsamples: vec![0; num_channels],
                 channel_info: vec![
                     channel_types
                         .iter()
@@ -134,6 +135,8 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
         )
     }
 
+    /// Adds a save stage for the output canvas associated with its buffer.
+    #[expect(clippy::too_many_arguments)]
     pub fn add_save_stage(
         self,
         channels: &[usize],
@@ -142,6 +145,7 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
         color_type: JxlColorType,
         data_format: JxlDataFormat,
         fill_opaque_alpha: bool,
+        output_viewport: Option<Rect>,
     ) -> Self {
         let stage = SaveStage::new(
             channels,
@@ -150,8 +154,13 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
             color_type,
             data_format,
             fill_opaque_alpha,
+            output_viewport,
         );
         self.add_stage_internal(Stage::Save(stage))
+    }
+
+    pub fn add_downsample_stage(self, stage: DownsampleStage) -> Self {
+        self.add_stage_internal(Stage::Downsample(stage))
     }
 
     pub fn add_extend_stage(self, extend: ExtendToImageDimensionsStage) -> Self {
@@ -160,6 +169,13 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
 
     pub fn add_inplace_stage<S: RenderPipelineInPlaceStage>(self, stage: S) -> Self {
         self.add_stage_internal(Stage::InPlace(Pipeline::box_inplace_stage(stage)))
+    }
+
+    pub fn with_channel_output_downsamples(mut self, levels: Vec<u8>) -> Self {
+        assert_eq!(levels.len(), self.shared.num_channels());
+        debug_assert!(levels.iter().all(|&level| level <= 3));
+        self.shared.channel_output_downsamples = levels;
+        self
     }
 
     pub fn add_inout_stage<S: RenderPipelineInOutStage>(self, stage: S) -> Self {
@@ -174,15 +190,15 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
         for i in (0..self.shared.stages.len()).rev() {
             let stage = &self.shared.stages[i];
             if matches!(stage, Stage::Save(_)) {
-                for c in 0..num_channels {
+                for (c, is_used) in self.shared.channel_is_used.iter_mut().enumerate() {
                     if stage.uses_channel(c) {
-                        self.shared.channel_is_used[c] = true;
+                        *is_used = true;
                     }
                 }
             }
-            for c in 0..num_channels {
+            for (c, &is_used) in self.shared.channel_is_used.iter().enumerate() {
                 if stage.uses_channel(c) {
-                    stage_is_used[i] |= self.shared.channel_is_used[c];
+                    stage_is_used[i] |= is_used;
                 }
             }
             // For now, mark stages with a shift as used.
@@ -194,9 +210,9 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
                 stage_is_used[i] = true;
             }
             if stage_is_used[i] {
-                for c in 0..num_channels {
-                    if self.shared.stages[i].uses_channel(c) {
-                        self.shared.channel_is_used[c] = true;
+                for (c, is_used) in self.shared.channel_is_used.iter_mut().enumerate() {
+                    if stage.uses_channel(c) {
+                        *is_used = true;
                     }
                 }
             }
@@ -240,14 +256,21 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
                     }
                     after_info.push(ChannelInfo {
                         ty: output_type.unwrap_or(input_type),
-                        downsample: shift,
+                        downsample: (0, 0),
                     });
                 }
             }
-            if self.shared.extend_stage_index.is_some()
-                && (shift != (0, 0) || border != (0, 0) || is_extend)
-            {
-                return Err(Error::PipelineInvalidStageAfterExtend(stage.to_string()));
+            if let Some(extend_index) = self.shared.extend_stage_index {
+                let Stage::Extend(extend) = &self.shared.stages[extend_index] else {
+                    unreachable!("extend stage is not an extend stage");
+                };
+
+                // Channels not in Extend stage have no data outside the frame; also reject those.
+                let uses_unextended_channel =
+                    (extend.num_channels..num_channels).any(|c| stage.uses_channel(c));
+                if shift != (0, 0) || border != (0, 0) || is_extend || uses_unextended_channel {
+                    return Err(Error::PipelineInvalidStageAfterExtend(stage.to_string()));
+                }
             }
             if is_extend {
                 self.shared.extend_stage_index = Some(i);
@@ -261,7 +284,12 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
         }
 
         let channel_info = &mut self.shared.channel_info;
-        let mut cur_downsamples = vec![(0u8, 0u8); num_channels];
+        let mut cur_downsamples: Vec<_> = self
+            .shared
+            .channel_output_downsamples
+            .iter()
+            .map(|&level| (level, level))
+            .collect();
         for (s, stage) in self.shared.stages.iter().enumerate().rev() {
             let next_info = &mut channel_info[s + 1];
             let mut save_downsample = None;
@@ -285,14 +313,20 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
                 }
                 let next_downsample = &mut next_chan.downsample;
                 let next_total_downsample = *cur_downsample;
+                let shift = if uses_channel { stage.shift() } else { (0, 0) };
                 cur_downsample.0 = cur_downsample
                     .0
-                    .checked_add(next_downsample.0)
+                    .checked_add_signed(shift.0)
                     .ok_or(Error::ArithmeticOverflow)?;
                 cur_downsample.1 = cur_downsample
                     .1
-                    .checked_add(next_downsample.1)
+                    .checked_add_signed(shift.1)
                     .ok_or(Error::ArithmeticOverflow)?;
+                if cur_downsample.0 as usize > self.shared.log_group_size
+                    || cur_downsample.1 as usize > self.shared.log_group_size
+                {
+                    return Err(Error::DownsampleTooHigh);
+                }
                 *next_downsample = next_total_downsample;
             }
         }

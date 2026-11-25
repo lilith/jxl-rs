@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::headers::color_encoding::ColorSpace;
 use crate::headers::{FileHeader, JxlHeader};
 use crate::icc::IncrementalIccReader;
+use crate::image::Rect;
 
 pub struct ImageInfo {
     file_header: Option<FileHeader>,
@@ -67,6 +68,7 @@ impl ImageInfo {
     pub fn parse_file_header(
         &mut self,
         decode_options: &JxlDecoderOptions,
+        downsample_factor: u8,
         br: &mut BitReader,
         bits: &mut usize,
         level5_limits: bool,
@@ -83,27 +85,25 @@ impl ImageInfo {
             ));
         }
 
-        let xsize = file_header.size.xsize() as usize;
-        let ysize = file_header.size.ysize() as usize;
+        let size = file_header.codestream_image_size();
         check_size_limit(
             decode_options.sample_limit,
-            (xsize, ysize),
+            size,
             file_header.image_metadata.extra_channel_info.len(),
+            0,
         )?;
         if let Some(preview) = &file_header.image_metadata.preview {
             check_size_limit(
                 decode_options.sample_limit,
                 (preview.xsize() as usize, preview.ysize() as usize),
                 file_header.image_metadata.extra_channel_info.len(),
+                0,
             )?;
         }
         let data = &file_header.image_metadata;
-        self.basic_info = Some(JxlBasicInfo {
-            size: if decode_options.adjust_orientation && data.orientation.is_transposing() {
-                (ysize, xsize)
-            } else {
-                (xsize, ysize)
-            },
+        let mut basic_info = JxlBasicInfo {
+            // Will be set by `update_size` below
+            size,
             bit_depth: if data.bit_depth.floating_point_sample() {
                 JxlBitDepth::Float {
                     bits_per_sample: data.bit_depth.bits_per_sample(),
@@ -143,17 +143,32 @@ impl ImageInfo {
                 .preview
                 .as_ref()
                 .map(|p| (p.xsize() as usize, p.ysize() as usize)),
-        });
+        };
+        basic_info.update_size(
+            &file_header,
+            decode_options.adjust_orientation,
+            downsample_factor,
+            Rect {
+                origin: (0, 0),
+                size,
+            },
+        );
+        self.basic_info = Some(basic_info);
         self.file_header = Some(file_header);
         *bits = br.total_bits_read();
         Ok(())
     }
 
-    pub fn parse_color_encoding(&mut self, br: &mut BitReader, bits: &mut usize) -> Result<()> {
+    pub fn parse_color_encoding(
+        &mut self,
+        br: &mut BitReader,
+        bits: &mut usize,
+        level5_limits: bool,
+    ) -> Result<()> {
         // Parse (or extract from file header) the ICC profile.
         let embedded_color_profile = if self.file_header().image_metadata.color_encoding.want_icc {
             if self.icc_parser.is_none() {
-                self.icc_parser = Some(IncrementalIccReader::new(br)?);
+                self.icc_parser = Some(IncrementalIccReader::new(br, level5_limits)?);
             }
             let icc_parser = self.icc_parser.as_mut().unwrap();
             *bits = br.total_bits_read();
@@ -182,6 +197,21 @@ impl ImageInfo {
 }
 
 impl CodestreamParser {
+    pub(in crate::api) fn update_size(&mut self, options: &JxlDecoderOptions) {
+        let Some(file_header) = &self.image_info.file_header else {
+            return;
+        };
+        let Some(basic_info) = &mut self.image_info.basic_info else {
+            return;
+        };
+        basic_info.update_size(
+            file_header,
+            options.adjust_orientation,
+            self.downsample_factor,
+            self.crop_region,
+        );
+    }
+
     pub fn update_default_output_options(&mut self) {
         assert!(self.image_info.is_complete());
 
@@ -232,7 +262,9 @@ impl CodestreamParser {
                     .unwrap_or(JxlDataFormat::U8 { bit_depth: 8 });
                 let is_float = matches!(
                     data_format,
-                    JxlDataFormat::F32 { .. } | JxlDataFormat::F16 { .. }
+                    JxlDataFormat::F32 { .. }
+                        | JxlDataFormat::F16 { .. }
+                        | JxlDataFormat::Custom { .. }
                 );
                 if is_float {
                     JxlColorEncoding::linear_srgb(self.image_info.is_gray())

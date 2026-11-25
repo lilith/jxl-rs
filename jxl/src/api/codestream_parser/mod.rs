@@ -3,17 +3,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-use crate::api::box_parser::CodestreamInput;
+use crate::api::box_parser::{BoxParser, CodestreamInput};
 use crate::api::codestream_parser::frame_info::FrameInfo;
 use crate::api::codestream_parser::frame_scan_info::FrameScanInfo;
 pub(crate) use crate::api::codestream_parser::frame_scan_info::FrameStartInfo;
 use crate::api::codestream_parser::image_info::ImageInfo;
 use crate::api::{
-    BoxParserCheckpoint, Event, JxlColorProfile, JxlDecoderOptions, JxlOutputBuffer,
-    JxlParallelRunner, JxlPixelFormat, ProfileLevel, SmallBuffer, VisibleFrameSeekTarget,
+    BoxParserCheckpoint, Event, JxlBytesNeeded, JxlColorProfile, JxlDecoderOptions,
+    JxlOutputBuffer, JxlParallelRunner, JxlPixelFormat, JxlProgressiveStatus, ProfileLevel,
+    SmallBuffer, VisibleFrameSeekTarget,
 };
 use crate::error::{Error, Result};
 use crate::headers::frame_header::FrameHeader;
+use crate::image::Rect;
 
 mod frame_info;
 mod frame_scan_info;
@@ -60,18 +62,28 @@ fn level5_limits(input: &CodestreamInput, decode_options: &JxlDecoderOptions) ->
 }
 
 fn check_size_limit(
-    pixel_limit: Option<usize>,
+    sample_limit: Option<usize>,
     (xs, ys): (usize, usize),
     num_ec: usize,
-) -> Result<()> {
-    if let Some(limit) = pixel_limit {
-        let xs = xs.max(16); // xsize is always at least 64 bytes.
-        let total_pixels = xs.saturating_mul(ys).saturating_mul(3 + num_ec);
-        if total_pixels >= limit {
-            return Err(Error::ImageSizeTooLarge(xs, ys));
-        }
-    };
-    Ok(())
+    previous_samples: usize,
+) -> Result<usize> {
+    let xs = xs.max(16); // xsize is always at least 64 bytes.
+    let channels = 3 + num_ec;
+    let total_samples = xs
+        .saturating_mul(ys)
+        .saturating_mul(channels)
+        .saturating_add(previous_samples);
+    if let Some(limit) = sample_limit
+        && total_samples >= limit
+    {
+        let err_size = if previous_samples == 0 {
+            (xs, ys)
+        } else {
+            (total_samples / channels, 1)
+        };
+        return Err(Error::ImageSizeTooLarge(err_size.0, err_size.1));
+    }
+    Ok(total_samples)
 }
 
 fn validate_output_buffers(
@@ -90,6 +102,19 @@ fn validate_output_buffers(
     if output_buffers.len() != expected_len {
         return Err(Error::WrongBufferCount(output_buffers.len(), expected_len));
     }
+    let formats = std::iter::once(&px.color_data_format)
+        .chain(px.extra_channel_format.iter())
+        .filter_map(|x| x.as_ref());
+    for (buf, fmt) in output_buffers.iter().zip(formats) {
+        let is_custom = matches!(fmt, crate::api::JxlDataFormat::Custom { .. });
+        if is_custom != buf.transform().is_some() {
+            return Err(Error::ApiUsageError(if is_custom {
+                "JxlDataFormat::Custom requires JxlOutputBuffer::with_transform"
+            } else {
+                "JxlOutputBuffer::with_transform requires JxlDataFormat::Custom"
+            }));
+        }
+    }
     Ok(())
 }
 
@@ -100,6 +125,7 @@ pub(super) struct CodestreamParser {
     pub image_info: ImageInfo,
     pub frame_info: FrameInfo,
     frame_scan_info: FrameScanInfo,
+    frame_header_decoded: bool,
 
     /// Total length of the file.
     pub file_length: Option<u64>,
@@ -111,6 +137,9 @@ pub(super) struct CodestreamParser {
     // Output information
     pub output_color_profile: Option<JxlColorProfile>,
     pub pixel_format: Option<JxlPixelFormat>,
+    pub downsample_factor: u8,
+    // This rect is unoriented but not downsampled.
+    pub crop_region: Rect,
 
     /// While seeking: the number of visible frames still to skip before the target.
     visible_frames_to_skip: Option<usize>,
@@ -141,6 +170,11 @@ impl CodestreamParser {
             state: ParserState::FileHeader,
             output_color_profile: None,
             pixel_format: None,
+            downsample_factor: 0,
+            crop_region: Rect {
+                origin: (0, 0),
+                size: (0, 0),
+            },
             local_buffer: SmallBuffer::new(4096),
             header_needed_bytes: None,
             frame_info: FrameInfo::new(),
@@ -150,6 +184,7 @@ impl CodestreamParser {
             #[cfg(test)]
             frames_decoded: 0,
             frame_scan_info: FrameScanInfo::new(),
+            frame_header_decoded: false,
             file_length: None,
         }
     }
@@ -159,11 +194,17 @@ impl CodestreamParser {
         self.image_info = ImageInfo::new();
         self.frame_info.reset((0, 0), [false; 8]);
         self.frame_scan_info = FrameScanInfo::new();
+        self.frame_header_decoded = false;
         self.file_length = None;
         self.local_buffer.reset();
         self.header_needed_bytes = None;
         self.output_color_profile = None;
         self.pixel_format = None;
+        self.downsample_factor = 0;
+        self.crop_region = Rect {
+            origin: (0, 0),
+            size: (0, 0),
+        };
         self.visible_frames_to_skip = None;
         self.next_frame_index = 0;
         self.slot_frames = [None; 8];
@@ -216,6 +257,10 @@ impl CodestreamParser {
         self.state = ParserState::FrameHeader { is_preview: false };
         self.header_needed_bytes = None;
         Ok(start.box_parser_checkpoint)
+    }
+
+    pub(super) fn frame_header_was_decoded(&self) -> bool {
+        self.frame_header_decoded
     }
 
     fn has_more_frames(&self) -> bool {
@@ -309,17 +354,29 @@ impl CodestreamParser {
                         input.box_parser().state_checkpoint(0)?;
                         c.local_buffer.with_br(|br, bits| {
                             let level5_limits = level5_limits(input, decode_options);
-                            c.image_info
-                                .parse_file_header(decode_options, br, bits, level5_limits)
+                            c.image_info.parse_file_header(
+                                decode_options,
+                                c.downsample_factor,
+                                br,
+                                bits,
+                                level5_limits,
+                            )
                         })
                     })?;
+                    let size = self.image_info.file_header().codestream_image_size();
+                    self.crop_region = Rect {
+                        origin: (0, 0),
+                        size,
+                    };
                     self.state = ParserState::ColorEncoding;
                 }
 
                 ParserState::ColorEncoding => {
-                    self.refill_and_parse(input, |c, _| {
-                        c.local_buffer
-                            .with_br(|br, bits| c.image_info.parse_color_encoding(br, bits))
+                    self.refill_and_parse(input, |c, input| {
+                        let level5_limits = level5_limits(input, decode_options);
+                        c.local_buffer.with_br(|br, bits| {
+                            c.image_info.parse_color_encoding(br, bits, level5_limits)
+                        })
                     })?;
                     self.update_default_output_options();
                     self.state = ParserState::FrameHeader {
@@ -348,6 +405,7 @@ impl CodestreamParser {
                             )
                         })
                     })?;
+                    self.frame_header_decoded = true;
                     self.state = ParserState::Toc { is_preview };
                 }
 
@@ -408,6 +466,22 @@ impl CodestreamParser {
                     }
 
                     let level5_limits = level5_limits(input, decode_options);
+                    let file_header = self.image_info.file_header();
+                    let downsample_factor = if is_preview {
+                        0
+                    } else {
+                        self.downsample_factor
+                    };
+                    let crop_region = if is_preview {
+                        let preview = file_header.image_metadata.preview.as_ref().unwrap();
+                        Rect {
+                            origin: (0, 0),
+                            size: (preview.xsize() as usize, preview.ysize() as usize),
+                        }
+                    } else {
+                        self.crop_region
+                            .downsample_ceil((downsample_factor, downsample_factor))
+                    };
                     self.frame_info.make_frame(
                         &mut self.local_buffer,
                         toc,
@@ -417,6 +491,8 @@ impl CodestreamParser {
                         self.output_color_profile.as_ref().unwrap(),
                         process_mode,
                         level5_limits,
+                        downsample_factor,
+                        crop_region,
                     )?;
 
                     if !matches!(process_mode, ProcessMode::Skip(..)) {
@@ -510,5 +586,71 @@ impl CodestreamParser {
             self.state,
             ParserState::Sections { process_mode, .. } if process_mode.notify_user()
         )
+    }
+
+    pub fn in_preview_frame(&self) -> bool {
+        match self.state {
+            ParserState::FrameHeader { is_preview }
+            | ParserState::Toc { is_preview }
+            | ParserState::Sections { is_preview, .. } => is_preview,
+            _ => false,
+        }
+    }
+
+    pub(super) fn frame_progressive_status(
+        &self,
+        decode_options: &JxlDecoderOptions,
+    ) -> Option<JxlProgressiveStatus> {
+        if decode_options.scan_frames_only
+            || matches!(
+                self.state,
+                ParserState::Sections {
+                    is_preview: true,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        if matches!(self.state, ParserState::TrailingData | ParserState::Done) {
+            return Some(JxlProgressiveStatus::Pass1x);
+        }
+        self.frame_info.frame()?.progressive_status()
+    }
+
+    pub(super) fn bytes_needed_for_status(
+        &self,
+        target: JxlProgressiveStatus,
+        box_parser: &BoxParser,
+        decode_options: &JxlDecoderOptions,
+    ) -> JxlBytesNeeded {
+        if self
+            .frame_progressive_status(decode_options)
+            .is_some_and(|s| s >= target)
+        {
+            return JxlBytesNeeded::Exact(0);
+        }
+        let ParserState::Sections {
+            is_preview: false,
+            process_mode,
+        } = self.state
+        else {
+            return JxlBytesNeeded::Unknown;
+        };
+        if matches!(process_mode, ProcessMode::Skip(_)) {
+            return JxlBytesNeeded::Unknown;
+        }
+        let Some(frame) = self.frame_info.frame() else {
+            return JxlBytesNeeded::Unknown;
+        };
+        let (needed, mut is_lower_bound) = frame.codestream_bytes_needed_for_status(
+            target,
+            self.frame_info.remaining_sections(),
+            self.frame_info.ready_section_data(),
+        );
+        if process_mode == ProcessMode::SkipOutput && frame.header().is_visible() {
+            is_lower_bound = true;
+        }
+        box_parser.input_bytes_needed(needed, is_lower_bound)
     }
 }

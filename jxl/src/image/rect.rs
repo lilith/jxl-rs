@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 use super::DataTypeTag;
+use crate::util::ShiftRightCeil;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Rect {
@@ -30,8 +31,8 @@ impl Rect {
 
     pub fn to_byte_rect_sz(&self, sz: usize) -> Rect {
         Rect {
-            origin: (self.origin.0 * sz, self.origin.1),
-            size: (self.size.0 * sz, self.size.1),
+            origin: (self.origin.0.checked_mul(sz).unwrap(), self.origin.1),
+            size: (self.size.0.checked_mul(sz).unwrap(), self.size.1),
         }
     }
 
@@ -42,8 +43,21 @@ impl Rect {
         }
     }
 
+    pub fn downsample_ceil(&self, downsample: (u8, u8)) -> Rect {
+        Rect {
+            origin: (self.origin.0 >> downsample.0, self.origin.1 >> downsample.1),
+            size: (
+                self.size.0.shrc(downsample.0),
+                self.size.1.shrc(downsample.1),
+            ),
+        }
+    }
+
     pub fn end(&self) -> (usize, usize) {
-        (self.origin.0 + self.size.0, self.origin.1 + self.size.1)
+        (
+            self.origin.0.saturating_add(self.size.0),
+            self.origin.1.saturating_add(self.size.1),
+        )
     }
 
     pub fn clip(&self, size: (usize, usize)) -> Rect {
@@ -57,10 +71,30 @@ impl Rect {
         }
     }
 
+    pub fn intersection(&self, other: Rect) -> Rect {
+        let origin = (
+            self.origin.0.max(other.origin.0),
+            self.origin.1.max(other.origin.1),
+        );
+        let end = (
+            self.end().0.min(other.end().0),
+            self.end().1.min(other.end().1),
+        );
+        Rect {
+            origin,
+            size: (
+                end.0.saturating_sub(origin.0),
+                end.1.saturating_sub(origin.1),
+            ),
+        }
+    }
+
     pub fn intersects(&self, other: &Rect) -> bool {
-        self.end().0 > other.origin.0
-            && other.end().0 > self.origin.0
-            && self.end().1 > other.origin.1
-            && other.end().1 > self.origin.1
+        let end_x = |r: &Rect| r.origin.0 as u128 + r.size.0 as u128;
+        let end_y = |r: &Rect| r.origin.1 as u128 + r.size.1 as u128;
+        end_x(self) > other.origin.0 as u128
+            && end_x(other) > self.origin.0 as u128
+            && end_y(self) > other.origin.1 as u128
+            && end_y(other) > self.origin.1 as u128
     }
 }

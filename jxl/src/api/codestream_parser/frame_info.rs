@@ -21,7 +21,7 @@ use crate::headers::FileHeader;
 use crate::headers::encodings::UnconditionalCoder;
 use crate::headers::frame_header::{Encoding, FrameHeader, FrameType};
 use crate::headers::toc::{IncrementalTocReader, Toc};
-use crate::image::BufferRecycler;
+use crate::image::{BufferRecycler, Rect};
 use crate::util::NewWithCapacity;
 use crate::util::sync::Arc;
 
@@ -80,6 +80,8 @@ pub struct FrameInfo {
     frame_counters: (usize, usize),
     // Which stored frames to keep in the next frame's decoder state (see `reset`).
     keep_slots: [bool; 8],
+    // Cumulative samples across consecutive non-visible frames since the last visible frame.
+    nonvisible_samples: usize,
 }
 
 impl FrameInfo {
@@ -101,6 +103,7 @@ impl FrameInfo {
             buffer_recycler: Arc::new(BufferRecycler::new()),
             frame_counters: (0, 0),
             keep_slots: [true; 8],
+            nonvisible_samples: 0,
         }
     }
 
@@ -114,6 +117,7 @@ impl FrameInfo {
         }
         self.frame_counters = frame_counters;
         self.keep_slots = keep_slots;
+        self.nonvisible_samples = 0;
     }
 
     pub fn clear(&mut self) {
@@ -136,6 +140,18 @@ impl FrameInfo {
         self.frame_header
             .as_ref()
             .or(self.frame.as_ref().map(|x| x.header()))
+    }
+
+    pub(super) fn frame(&self) -> Option<&Frame> {
+        self.frame.as_deref()
+    }
+
+    pub(super) fn remaining_sections(&self) -> usize {
+        self.sections.len()
+    }
+
+    pub(super) fn ready_section_data(&self) -> usize {
+        self.ready_section_data
     }
 
     #[cfg(test)]
@@ -163,10 +179,17 @@ impl FrameInfo {
 
         let mut frame_header = FrameHeader::read_unconditional(&(), br, &nonserialized)?;
         frame_header.postprocess(&nonserialized);
-        check_size_limit(
+        let is_visible = frame_header.is_visible();
+        let effective_nonvisible_samples = if is_visible {
+            0
+        } else {
+            self.nonvisible_samples
+        };
+        let total_samples = check_size_limit(
             decode_options.sample_limit,
             frame_header.size_upsampled(),
             frame_header.num_extra_channels as usize,
+            effective_nonvisible_samples,
         )?;
 
         if level5_limits
@@ -185,6 +208,7 @@ impl FrameInfo {
             ));
         }
 
+        self.nonvisible_samples = if is_visible { 0 } else { total_samples };
         self.frame_header = Some(frame_header);
         *bits = br.total_bits_read();
         Ok(())
@@ -223,6 +247,8 @@ impl FrameInfo {
         output_profile: &JxlColorProfile,
         process_mode: ProcessMode,
         level5_limits: bool,
+        downsample_factor: u8,
+        output_viewport: Rect,
     ) -> Result<()> {
         self.section_size = toc.entries.iter().map(|x| *x as u64).sum();
         self.ready_section_data = 0;
@@ -250,7 +276,13 @@ impl FrameInfo {
                 .map(|x| x.finalize())
                 .transpose()?
                 .unwrap_or_else(|| {
-                    DecoderState::new(file_header.clone(), decode_options, level5_limits)
+                    DecoderState::new(
+                        file_header.clone(),
+                        decode_options,
+                        level5_limits,
+                        downsample_factor,
+                        output_viewport,
+                    )
                 });
             decoder_state.level5_limits = level5_limits;
             decoder_state.keep_slots(std::mem::replace(&mut self.keep_slots, [true; 8]));

@@ -15,15 +15,8 @@ use jxl_cli::dec;
 use jxl_cli::dec::OutputDataType;
 use jxl_cli::enc::OutputFormat;
 
-const VERSION_STRING: &str = concat!(
-    env!("VERGEN_GIT_DESCRIBE"),
-    " (rustc ",
-    env!("VERGEN_RUSTC_SEMVER"),
-    ")"
-);
-
 #[derive(Parser)]
-#[command(version = VERSION_STRING)]
+#[command(version = jxl_cli::VERSION_STRING)]
 struct Opt {
     /// Input JXL file
     input: PathBuf,
@@ -46,7 +39,7 @@ struct Opt {
     num_reps: usize,
 
     /// Number of warmup decodes before measuring (only valid with --speedtest).
-    #[clap(long, default_value_t = 1, requires = "speedtest")]
+    #[clap(long, short, default_value_t = 1, requires = "speedtest")]
     warmup_reps: usize,
 
     ///  If specified, writes the ICC profile of the decoded image
@@ -68,6 +61,10 @@ struct Opt {
     /// Print image information without decoding
     #[clap(long, short, action)]
     info: bool,
+
+    /// Render at 1 / 2^factor resolution (0 = full resolution, maximum 3).
+    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
+    downsample_factor: u8,
 
     /// Use high precision mode for decoding
     #[clap(long)]
@@ -100,15 +97,7 @@ fn save_icc(icc_bytes: &[u8], icc_filename: Option<&PathBuf>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    #[cfg(feature = "tracing-subscriber")]
-    {
-        use tracing_subscriber::prelude::*;
-        use tracing_subscriber::{EnvFilter, fmt};
-        tracing_subscriber::registry()
-            .with(fmt::layer())
-            .with(EnvFilter::from_default_env())
-            .init();
-    }
+    jxl_cli::init_tracing();
 
     let opt = Opt::parse();
     let mut file = fs::File::open(opt.input.clone())
@@ -192,6 +181,7 @@ fn main() -> Result<()> {
                 linear_output,
                 opt.render_interval,
                 opt.allow_partial_files,
+                opt.downsample_factor,
                 $prev_output,
             )
             .map_err(|err| {
@@ -257,8 +247,9 @@ fn main() -> Result<()> {
     };
 
     // Get metadata from typed output before converting
-    let output_icc = output.output_profile.as_icc().to_vec();
-    let embedded_icc = output.embedded_profile.as_icc().to_vec();
+    let intensity_target = decoder.basic_info().unwrap().tone_mapping.intensity_target;
+    let output_icc = output.output_profile.as_icc(intensity_target).to_vec();
+    let embedded_icc = output.embedded_profile.as_icc(intensity_target).to_vec();
     let image_size = output.size;
 
     if opt.speedtest {
